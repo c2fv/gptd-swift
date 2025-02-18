@@ -149,7 +149,7 @@ class NativeActionExecutor {
         self.app = app
     }
     
-    func executeCommand(with data: [String: Any]) {
+    func executeCommand(with data: [String: Any]) async {
         guard let jsonData = try? JSONSerialization.data(withJSONObject: data, options: []) else {
             os_log("NativeActionExecutor: Failed to convert command data to JSON", log: OSLog.default, type: .error)
             return
@@ -164,17 +164,19 @@ class NativeActionExecutor {
         for group in payload.actions {
             switch group.type {
             case "pointer":
-                executePointerActions(group.actions)
+                await executePointerActions(group.actions)
             case "key":
-                executeKeyActions(group.actions)
+                await executeKeyActions(group.actions)
+            case "pause":
+                await executePauseActions(group.actions)
             default:
                 os_log("NativeActionExecutor: Unsupported action group type: %{public}@", log: OSLog.default, type: .error, group.type)
             }
         }
     }
     
-    private func executePointerActions(_ actions: [WebDriverAction]) {
-        Task { @MainActor in
+    private func executePointerActions(_ actions: [WebDriverAction]) async {
+        await MainActor.run {
             if actions.count == 4,
                let first = actions.first,
                first.type == "pointerMove",
@@ -201,8 +203,8 @@ class NativeActionExecutor {
         }
     }
     
-    private func executeKeyActions(_ actions: [WebDriverAction]) {
-        Task { @MainActor in
+    private func executeKeyActions(_ actions: [WebDriverAction]) async {
+        await MainActor.run {
             if let first = actions.first,
                first.type == "keyDown",
                let value = first.value,
@@ -220,6 +222,20 @@ class NativeActionExecutor {
         }
     }
     
+    private func executePauseActions(_ actions: [WebDriverAction]) async {
+        for action in actions {
+            if action.type == "pause", let duration = action.duration {
+                let nanoseconds = UInt64(duration) * 1_000_000
+                do {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } catch {
+                    os_log("NativeActionExecutor: Pause interrupted with error: %{public}@", log: OSLog.default, type: .error, error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    
     private func coordinateFor(x: Double, y: Double) -> XCUICoordinate {
         let scale = UIScreen.main.scale
         let pointX = x / Double(scale)
@@ -231,7 +247,6 @@ class NativeActionExecutor {
 }
 
 // MARK: - GptDriver Class
-
 public class GptDriver {
     // MARK: - Properties
     private let apiKey: String
@@ -250,7 +265,6 @@ public class GptDriver {
     var logger = OSLog(subsystem: "com.gptdriver", category: "GPTD-Client")
     
     // MARK: - Initializer
-    
     public init(apiKey: String,
                 appiumServerUrl: URL? = nil,
                 deviceName: String? = nil,
@@ -406,18 +420,27 @@ public class GptDriver {
     
     // MARK: - Command Processing
     private func processCommands(_ commands: [AppiumCommand]) async throws {
-        if let _ = appiumServerUrl {
-            for command in commands {
+        for command in commands {
+            if let data = command.data,
+               let actions = data["actions"] as? [[String: Any]],
+               let firstAction = actions.first,
+               let type = firstAction["type"] as? String,
+               type == "pause",
+               let duration = firstAction["duration"] as? Int {
+                os_log("Executing pause for %{public}d seconds", log: logger, type: .info, duration)
+                try await Task.sleep(nanoseconds: UInt64(duration) * 1_000_000_000)
+                continue
+            }
+            
+            if let _ = appiumServerUrl {
                 try await executeAppiumRequest(command: command)
-            }
-        } else {
-            guard let nativeApp = self.nativeApp else {
-                throw GPTDriverError.executionFailed("No native XCUIApplication provided in native mode")
-            }
-            let executor = NativeActionExecutor(app: nativeApp)
-            for command in commands {
+            } else {
+                guard let nativeApp = self.nativeApp else {
+                    throw GPTDriverError.executionFailed("No native XCUIApplication provided in native mode")
+                }
+                let executor = NativeActionExecutor(app: nativeApp)
                 if let data = command.data {
-                    executor.executeCommand(with: data)
+                    await executor.executeCommand(with: data)
                 } else {
                     os_log("processCommands: Missing command data for command: %@", log: OSLog.default, type: .error, command.url)
                 }
