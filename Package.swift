@@ -14,6 +14,10 @@ let package = Package(
     dependencies: [],
     targets: [
         .target(
-            name: "gptd-swift"),
+            name: "gptd-swift",
+            dependencies: [],
+            linkerSettings: [
+                .linkedFramework("XCTest")
+            ])
     ]
 )

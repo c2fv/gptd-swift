@@ -265,12 +265,12 @@ public class GptDriver {
     var logger = OSLog(subsystem: "com.gptdriver", category: "GPTD-Client")
     
     // MARK: - Initializer
-    public init(apiKey: String,
-                appiumServerUrl: URL? = nil,
-                deviceName: String? = nil,
-                platform: String? = nil,
-                platformVersion: String? = nil,
-                nativeApp: XCUIApplication? = nil) {
+    private init(apiKey: String,
+                  appiumServerUrl: URL? = nil,
+                  deviceName: String? = nil,
+                  platform: String? = nil,
+                  platformVersion: String? = nil,
+                  nativeApp: XCUIApplication? = nil) {
         self.apiKey = apiKey
         self.appiumServerUrl = appiumServerUrl
         self.deviceName = deviceName
@@ -283,6 +283,30 @@ public class GptDriver {
         } else {
             self.nativeApp = nil
         }
+    }
+    
+    /// Initializes GptDriver for native XCUITest execution.
+    /// - Parameters:
+    ///   - apiKey: Your GPT Driver API key.
+    ///   - nativeApp: The XCUIApplication instance representing the app under test. Defaults to `XCUIApplication()`
+    public convenience init(apiKey: String,
+                            nativeApp: XCUIApplication = XCUIApplication()) {
+        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp)
+    }
+    
+    /// Initializes GptDriver for execution via a remote Appium server.
+    /// - Parameters:
+    ///   - apiKey: Your GPT Driver API key.
+    ///   - appiumServerUrl: The URL of the Appium server.
+    ///   - deviceName: The name of the target device (e.g., "iPhone 15 Pro").
+    ///   - platform: The target platform (e.g., "iOS").
+    ///   - platformVersion: The OS version of the target device (e.g., "18.2").
+    public convenience init(apiKey: String,
+                            appiumServerUrl: URL,
+                            deviceName: String,
+                            platform: String,
+                            platformVersion: String) {
+        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil)
     }
     
     // MARK: - Public Methods
@@ -316,7 +340,8 @@ public class GptDriver {
             
             switch executeResponse.status {
             case "failed":
-                throw GPTDriverError.executionFailed("GPT Driver reported execution failed.")
+                let details = "\(String(describing: executeResponse.commands))"
+                throw GPTDriverError.executionFailed("GPT Driver reported execution failed. " + details)
             case "inProgress":
                 try await processCommands(executeResponse.commands)
             default:
@@ -550,6 +575,152 @@ public class GptDriver {
             let frame = await app.windows.firstMatch.frame
             return frame.size
         }
+    }
+
+    // MARK: - Assertion Methods
+    public func assert(_ assertion: String) async throws {
+        if !appiumSessionStarted || gptDriverSessionId == nil {
+            try await startSession()
+        }
+        
+        do {
+            let results = try await checkBulk([assertion])
+            guard let firstResult = results.values.first, firstResult else {
+                try await setSessionStatus(status: "failed")
+                throw GPTDriverError.executionFailed("Failed assertion: \(assertion)")
+            }
+        } catch {
+            try await setSessionStatus(status: "failed")
+            throw error
+        }
+    }
+
+    public func assertBulk(_ assertions: [String]) async throws {
+        if !appiumSessionStarted || gptDriverSessionId == nil {
+            try await startSession()
+        }
+        
+        do {
+            let results = try await checkBulk(assertions)
+            
+            var failedAssertions: [String] = []
+            for (index, result) in results.values.enumerated() {
+                if !result, index < assertions.count {
+                    failedAssertions.append(assertions[index])
+                }
+            }
+            
+            if !failedAssertions.isEmpty {
+                try await setSessionStatus(status: "failed")
+                throw GPTDriverError.executionFailed("Failed assertions: \(failedAssertions.joined(separator: ", "))")
+            }
+        } catch {
+            try await setSessionStatus(status: "failed")
+            throw error
+        }
+    }
+
+    public func checkBulk(_ conditions: [String]) async throws -> [String: Bool] {
+        if !appiumSessionStarted || gptDriverSessionId == nil {
+            try await startSession()
+        }
+        
+        os_log("Checking: %{public}@", log: logger, type: .info, conditions)
+        
+        do {
+            // Take a screenshot using XCUI instead of Appium
+            let screenshotBase64 = try await takeScreenshotBase64()
+            
+            // Build request to GPT Driver API
+            let requestUrl = gptDriverBaseUrl
+                .appendingPathComponent("sessions")
+                .appendingPathComponent(gptDriverSessionId!)
+                .appendingPathComponent("assert")
+            
+            let requestBody: [String: Any] = [
+                "api_key": apiKey,
+                "base64_screenshot": screenshotBase64,
+                "assertions": conditions,
+                "command": "Assert: \(String(describing: try? JSONSerialization.data(withJSONObject: conditions, options: [])))"
+            ]
+            
+            let responseData = try await postJson(to: requestUrl, jsonObject: requestBody)
+            
+            // Parse the response to get results
+            guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+                  let results = json["results"] as? [String: Bool] else {
+                throw GPTDriverError.invalidResponse
+            }
+            
+            return results
+        } catch {
+            try await setSessionStatus(status: "failed")
+            throw error
+        }
+    }
+
+    public func setSessionStatus(status: String) async throws {
+        guard let gptDriverSessionId = gptDriverSessionId else {
+            return
+        }
+        
+        os_log("Stopping session...", log: logger, type: .info)
+        
+        let requestUrl = gptDriverBaseUrl
+            .appendingPathComponent("sessions")
+            .appendingPathComponent(gptDriverSessionId)
+            .appendingPathComponent("stop")
+        
+        let requestBody: [String: Any] = [
+            "api_key": apiKey,
+            "status": status
+        ]
+        
+        _ = try await postJson(to: requestUrl, jsonObject: requestBody)
+        
+        os_log("Session stopped", log: logger, type: .info)
+        appiumSessionStarted = false
+        self.gptDriverSessionId = nil
+    }
+    
+    public func extract(_ extractions: [String]) async throws -> [String: Any] {
+        if !appiumSessionStarted || gptDriverSessionId == nil {
+            try await startSession()
+        }
+        
+        os_log("Extracting: %{public}@", log: logger, type: .info, extractions.description)
+        
+        // Take a screenshot using XCUI
+        let screenshotBase64 = try await takeScreenshotBase64()
+        
+        // Build request to GPT Driver API
+        let requestUrl = gptDriverBaseUrl
+            .appendingPathComponent("sessions")
+            .appendingPathComponent(gptDriverSessionId!)
+            .appendingPathComponent("extract")
+        
+        var extractionsJson = ""
+        if let data = try? JSONSerialization.data(withJSONObject: extractions, options: []),
+           let jsonString = String(data: data, encoding: .utf8) {
+            extractionsJson = jsonString
+        }
+        
+        let requestBody: [String: Any] = [
+            "api_key": apiKey,
+            "base64_screenshot": screenshotBase64,
+            "extractions": extractions,
+            "command": "Extract: \(extractionsJson)"
+        ]
+        
+        let responseData = try await postJson(to: requestUrl, jsonObject: requestBody)
+        
+        // Parse the response to get results
+        guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+              let results = json["results"] as? [String: Any] else {
+            throw GPTDriverError.invalidResponse
+        }
+        
+        return results
     }
 }
 
