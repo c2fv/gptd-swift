@@ -261,8 +261,32 @@ public class GptDriver {
     private var appiumSessionStarted = false
     private let gptDriverBaseUrl: URL
     private var gptDriverSessionId: String?
+    public private(set) var sessionURL: String?
+    
+    /// Optional callback that is invoked when a new session is created.
+    /// Use this to capture the session URL for logging, attachments, or custom handling.
+    /// - Parameter sessionURL: The live session URL
+    public var onSessionCreated: ((String) -> Void)?
     
     var logger = OSLog(subsystem: "com.gptdriver", category: "GPTD-Client")
+    
+    private lazy var customURLSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 90
+        configuration.timeoutIntervalForResource = 180
+        configuration.allowsCellularAccess = true
+        configuration.waitsForConnectivity = true
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+
+        let delegateQueue = OperationQueue()
+        delegateQueue.maxConcurrentOperationCount = 1
+        delegateQueue.qualityOfService = .userInitiated
+        delegateQueue.name = "com.gptdriver.network"
+        
+        return URLSession(configuration: configuration, 
+                         delegate: nil, 
+                         delegateQueue: delegateQueue)
+    }()
     
     // MARK: - Initializer
     private init(apiKey: String,
@@ -307,6 +331,10 @@ public class GptDriver {
                             platform: String,
                             platformVersion: String) {
         self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil)
+    }
+    
+    deinit {
+        customURLSession.invalidateAndCancel()
     }
     
     // MARK: - Public Methods
@@ -441,6 +469,10 @@ public class GptDriver {
         let sessionURL = "https://app.mobileboost.io/gpt-driver/sessions/\(sessionId)"
         os_log("Live Session View: %@", log: OSLog.default, type: .info, sessionURL)
         self.gptDriverSessionId = sessionId
+        self.sessionURL = sessionURL
+        
+        // Notify callback if provided
+        onSessionCreated?(sessionURL)
     }
     
     // MARK: - Command Processing
@@ -477,26 +509,93 @@ public class GptDriver {
     private func postJson(to url: URL, jsonObject: [String: Any]) async throws -> Data {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = 90
         
         let bodyData = try JSONSerialization.data(withJSONObject: jsonObject)
         request.httpBody = bodyData
         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
         
-        let (data, response) = try await URLSession.shared.data(for: request)
+        return try await performRequestWithRetry(request: request)
+    }
+    
+    private func performRequestWithRetry(request: URLRequest, maxRetries: Int = 3) async throws -> Data {
+        var lastError: Error?
         
-        guard let httpResponse = response as? HTTPURLResponse,
-              200..<300 ~= httpResponse.statusCode else {
-            throw GPTDriverError.invalidResponse
+        for attempt in 0..<maxRetries {
+            do {
+                let (data, response) = try await customURLSession.data(for: request)
+                
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw GPTDriverError.invalidResponse
+                }
+                
+                if 200..<300 ~= httpResponse.statusCode {
+                    if attempt > 0 {
+                        os_log("Request succeeded on attempt %d", log: logger, type: .info, attempt + 1)
+                    }
+                    return data
+                }
+                
+                if shouldRetry(statusCode: httpResponse.statusCode) && attempt < maxRetries - 1 {
+                    let delay = exponentialBackoff(attempt: attempt)
+                    os_log("Request failed with status %d, retrying after %f seconds", log: logger, type: .info, httpResponse.statusCode, delay)
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    continue
+                }
+                
+                throw GPTDriverError.invalidResponse
+            } catch let error as URLError {
+                lastError = error
+                os_log("Network error: %@ (code: %d)", log: logger, type: .error, error.localizedDescription, error.code.rawValue)
+                
+                if shouldRetryURLError(error) && attempt < maxRetries - 1 {
+                    let delay = exponentialBackoff(attempt: attempt)
+                    os_log("Retrying after %f seconds due to: %@", log: logger, type: .info, delay, error.localizedDescription)
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    continue
+                }
+                
+                throw error
+            } catch {
+                lastError = error
+                throw error
+            }
         }
         
-        return data
+        throw lastError ?? GPTDriverError.invalidResponse
+    }
+    
+    private func shouldRetry(statusCode: Int) -> Bool {
+        // Retry on server errors and rate limiting
+        return statusCode >= 500 || statusCode == 429 || statusCode == 408
+    }
+    
+    private func shouldRetryURLError(_ error: URLError) -> Bool {
+        switch error.code {
+        case .timedOut,
+             .networkConnectionLost,
+             .notConnectedToInternet,
+             .cannotConnectToHost,
+             .cannotFindHost,
+             .dnsLookupFailed:
+            return true
+        default:
+            return false
+        }
+    }
+    
+    private func exponentialBackoff(attempt: Int) -> Double {
+        return min(pow(2.0, Double(attempt)) * 2.0, 16.0)
     }
     
     private func getJson(from url: URL) async throws -> [String: Any] {
-        let (data, response) = try await URLSession.shared.data(from: url)
-        guard let httpResponse = response as? HTTPURLResponse,
-              200..<300 ~= httpResponse.statusCode,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 90
+        
+        let data = try await performRequestWithRetry(request: request)
+        
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw GPTDriverError.invalidResponse
         }
         return json
@@ -510,6 +609,7 @@ public class GptDriver {
         
         var request = URLRequest(url: endpoint)
         request.httpMethod = command.method
+        request.timeoutInterval = 90
         
         if let jsonDictionary = command.data {
             let bodyData = try JSONSerialization.data(withJSONObject: jsonDictionary)
@@ -517,12 +617,7 @@ public class GptDriver {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
         
-        let (_, response) = try await URLSession.shared.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse,
-              200..<300 ~= httpResponse.statusCode else {
-            throw GPTDriverError.invalidResponse
-        }
+        _ = try await performRequestWithRetry(request: request)
     }
     
     // MARK: - Screenshot Helper
@@ -578,13 +673,19 @@ public class GptDriver {
     }
 
     // MARK: - Assertion Methods
-    public func assert(_ assertion: String) async throws {
+    /// Asserts a condition with automatic retries.
+    /// 
+    /// - Parameters:
+    ///   - assertion: The condition to assert
+    ///   - maxRetries: Number of retry attempts (default: 2)
+    ///   - retryDelay: Delay in seconds between retries (default: 1.0)
+    public func assert(_ assertion: String, maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
         
         do {
-            let results = try await checkBulk([assertion])
+            let results = try await checkBulk([assertion], maxRetries: maxRetries, retryDelay: retryDelay)
             guard let firstResult = results.values.first, firstResult else {
                 try await setSessionStatus(status: "failed")
                 throw GPTDriverError.executionFailed("Failed assertion: \(assertion)")
@@ -595,13 +696,19 @@ public class GptDriver {
         }
     }
 
-    public func assertBulk(_ assertions: [String]) async throws {
+    /// Asserts multiple conditions with automatic retries.
+    ///
+    /// - Parameters:
+    ///   - assertions: Array of conditions to assert
+    ///   - maxRetries: Number of retry attempts (default: 2)
+    ///   - retryDelay: Delay in seconds between retries (default: 1.0)
+    public func assertBulk(_ assertions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
         
         do {
-            let results = try await checkBulk(assertions)
+            let results = try await checkBulk(assertions, maxRetries: maxRetries, retryDelay: retryDelay)
             
             var failedAssertions: [String] = []
             for (index, result) in results.values.enumerated() {
@@ -620,43 +727,91 @@ public class GptDriver {
         }
     }
 
-    public func checkBulk(_ conditions: [String]) async throws -> [String: Bool] {
+    /// Checks multiple conditions with automatic retries.
+    ///
+    /// - Parameters:
+    ///   - conditions: Array of conditions to check
+    ///   - maxRetries: Number of retry attempts (default: 2)
+    ///   - retryDelay: Delay in seconds between retries (default: 1.0)
+    /// - Returns: Dictionary mapping conditions to boolean results
+    public func checkBulk(_ conditions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws -> [String: Bool] {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
         
         os_log("Checking: %{public}@", log: logger, type: .info, conditions)
         
-        do {
-            // Take a screenshot using XCUI instead of Appium
-            let screenshotBase64 = try await takeScreenshotBase64()
-            
-            // Build request to GPT Driver API
-            let requestUrl = gptDriverBaseUrl
-                .appendingPathComponent("sessions")
-                .appendingPathComponent(gptDriverSessionId!)
-                .appendingPathComponent("assert")
-            
-            let requestBody: [String: Any] = [
-                "api_key": apiKey,
-                "base64_screenshot": screenshotBase64,
-                "assertions": conditions,
-                "command": "Assert: \(String(describing: try? JSONSerialization.data(withJSONObject: conditions, options: [])))"
-            ]
-            
-            let responseData = try await postJson(to: requestUrl, jsonObject: requestBody)
-            
-            // Parse the response to get results
-            guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-                  let results = json["results"] as? [String: Bool] else {
-                throw GPTDriverError.invalidResponse
+        var lastError: Error?
+        var lastResults: [String: Bool]?
+        
+        for attempt in 0...maxRetries {
+            do {
+                // Take a screenshot using XCUI instead of Appium
+                let screenshotBase64 = try await takeScreenshotBase64()
+                
+                // Build request to GPT Driver API
+                let requestUrl = gptDriverBaseUrl
+                    .appendingPathComponent("sessions")
+                    .appendingPathComponent(gptDriverSessionId!)
+                    .appendingPathComponent("assert")
+                
+                let requestBody: [String: Any] = [
+                    "api_key": apiKey,
+                    "base64_screenshot": screenshotBase64,
+                    "assertions": conditions,
+                    "command": "Assert: \(String(describing: try? JSONSerialization.data(withJSONObject: conditions, options: [])))"
+                ]
+                
+                let responseData = try await postJson(to: requestUrl, jsonObject: requestBody)
+                
+                // Parse the response to get results
+                guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+                      let results = json["results"] as? [String: Bool] else {
+                    throw GPTDriverError.invalidResponse
+                }
+                
+                lastResults = results
+                
+                // Check if all conditions passed
+                let allPassed = results.values.allSatisfy { $0 }
+                
+                if allPassed {
+                    if attempt > 0 {
+                        os_log("Check succeeded on attempt %d", log: logger, type: .info, attempt + 1)
+                    }
+                    return results
+                }
+                
+                // Some conditions failed
+                if attempt < maxRetries {
+                    let failedConditions = results.filter { !$0.value }.keys.joined(separator: ", ")
+                    os_log("Check failed on attempt %d (failed: %{public}@), retrying after %.1f seconds...", log: logger, type: .info, attempt + 1, failedConditions, retryDelay)
+                    try await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
+                    continue
+                }
+                
+                // All retries exhausted, return the last results (with failures)
+                return results
+                
+            } catch {
+                lastError = error
+                
+                if attempt < maxRetries {
+                    os_log("Check error on attempt %d: %@, retrying after %.1f seconds...", log: logger, type: .info, attempt + 1, error.localizedDescription, retryDelay)
+                    try await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
+                    continue
+                }
+                
+                try await setSessionStatus(status: "failed")
+                throw error
             }
-            
-            return results
-        } catch {
-            try await setSessionStatus(status: "failed")
-            throw error
         }
+        
+        // Fallback: return last results if available, otherwise throw last error
+        if let results = lastResults {
+            return results
+        }
+        throw lastError ?? GPTDriverError.invalidResponse
     }
 
     public func setSessionStatus(status: String) async throws {
@@ -681,6 +836,7 @@ public class GptDriver {
         os_log("Session stopped", log: logger, type: .info)
         appiumSessionStarted = false
         self.gptDriverSessionId = nil
+        self.sessionURL = nil
     }
     
     public func extract(_ extractions: [String]) async throws -> [String: Any] {
