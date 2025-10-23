@@ -183,8 +183,18 @@ class NativeActionExecutor {
                let x = first.x,
                let y = first.y {
                 
+                var pressDuration: TimeInterval = 0.2
+                if actions.count > 2 {
+                    for action in actions {
+                        if action.type == "pause", let duration = action.duration {
+                            pressDuration = Double(duration) / 1000.0
+                            break
+                        }
+                    }
+                }
+                
                 let coordinate = self.coordinateFor(x: x, y: y)
-                coordinate.tap()
+                coordinate.press(forDuration: pressDuration)
                 
             } else if actions.count == 5,
                       let first = actions.first,
