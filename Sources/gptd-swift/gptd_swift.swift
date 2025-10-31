@@ -43,6 +43,8 @@ struct AppiumCommand: Decodable {
         
         if let rawData = try? container.decode([String: AnyDecodable].self, forKey: .data) {
             self.data = rawData.mapValues { $0.value }
+        } else if let stringData = try? container.decode(String.self, forKey: .data) {
+            self.data = ["value": stringData]
         } else {
             self.data = nil
         }
@@ -81,6 +83,29 @@ enum GPTDriverError: Error {
     case invalidResponse
     case missingSessionId
     case creationFailed(String)
+}
+
+enum GPTLogLevel {
+    case debug
+    case info
+    case notice
+    case warning
+    case error
+    
+    var osLogType: OSLogType {
+        switch self {
+        case .debug:
+            return .debug
+        case .info:
+            return .info
+        case .notice:
+            return .default
+        case .warning:
+            return .error
+        case .error:
+            return .fault
+        }
+    }
 }
 
 // MARK: - Native Executor Types
@@ -144,20 +169,37 @@ extension Collection {
 
 class NativeActionExecutor {
     let app: XCUIApplication
+    private let logger: Logger
+    private let sessionIdProvider: () -> String?
     
-    init(app: XCUIApplication) {
+    init(app: XCUIApplication, logger: Logger, sessionIdProvider: @escaping () -> String?) {
         self.app = app
+        self.logger = logger
+        self.sessionIdProvider = sessionIdProvider
+    }
+    
+    private func log(_ level: GPTLogLevel, _ message: String, metadata: [String: Any] = [:]) {
+        let sessionId = sessionIdProvider() ?? "no-session"
+        let metadataString = metadata
+            .map { "\($0.key)=\($0.value)" }
+            .sorted()
+            .joined(separator: ", ")
+        if metadataString.isEmpty {
+            logger.log(level: level.osLogType, "[gptd-session:\(sessionId)] \(message, privacy: .public)")
+        } else {
+            logger.log(level: level.osLogType, "[gptd-session:\(sessionId)] \(message, privacy: .public) | \(metadataString, privacy: .public)")
+        }
     }
     
     func executeCommand(with data: [String: Any]) async {
         guard let jsonData = try? JSONSerialization.data(withJSONObject: data, options: []) else {
-            os_log("NativeActionExecutor: Failed to convert command data to JSON", log: OSLog.default, type: .error)
+            log(.error, "NativeActionExecutor failed to convert command data to JSON")
             return
         }
         
         let decoder = JSONDecoder()
         guard let payload = try? decoder.decode(WebDriverPayload.self, from: jsonData) else {
-            os_log("NativeActionExecutor: Failed to decode JSON payload", log: OSLog.default, type: .error)
+            log(.error, "NativeActionExecutor failed to decode JSON payload")
             return
         }
         
@@ -165,12 +207,17 @@ class NativeActionExecutor {
             switch group.type {
             case "pointer":
                 await executePointerActions(group.actions)
+                do {
+                    try await Task.sleep(nanoseconds: 1_500_000_000)
+                } catch {
+                    log(.warning, "Sleep after pointer actions interrupted", metadata: ["error": error.localizedDescription])
+                }
             case "key":
                 await executeKeyActions(group.actions)
             case "pause":
                 await executePauseActions(group.actions)
             default:
-                os_log("NativeActionExecutor: Unsupported action group type: %{public}@", log: OSLog.default, type: .error, group.type)
+                log(.error, "Unsupported action group type", metadata: ["groupType": group.type])
             }
         }
     }
@@ -194,6 +241,12 @@ class NativeActionExecutor {
                 }
                 
                 let coordinate = self.coordinateFor(x: x, y: y)
+                log(.info, "Pointer press", metadata: [
+                    "x": x,
+                    "y": y,
+                    "duration": pressDuration
+                ])
+                XCTContext.runActivity(named: "GPTDriver Press for \(pressDuration)s at \(x), \(y)") { _ in }
                 coordinate.press(forDuration: pressDuration)
                 
             } else if actions.count == 5,
@@ -206,9 +259,16 @@ class NativeActionExecutor {
                 
                 let startCoordinate = coordinateFor(x: xStart, y: yStart)
                 let endCoordinate = coordinateFor(x: xEnd, y: yEnd)
+                log(.info, "Pointer drag", metadata: [
+                    "startX": xStart,
+                    "startY": yStart,
+                    "endX": xEnd,
+                    "endY": yEnd
+                ])
+                XCTContext.runActivity(named: "GPTDriver Drag from \(xStart), \(yStart) to \(xEnd), \(yEnd)") { _ in }
                 startCoordinate.press(forDuration: 0.1, thenDragTo: endCoordinate)
             } else {
-                os_log("NativeActionExecutor: Unrecognized pointer actions pattern", log: OSLog.default, type: .error)
+                log(.error, "Unrecognized pointer actions pattern", metadata: ["actionCount": actions.count])
             }
         }
     }
@@ -219,6 +279,8 @@ class NativeActionExecutor {
                first.type == "keyDown",
                let value = first.value,
                value == "\u{e011}" {
+                log(.info, "Invoking home button")
+                XCTContext.runActivity(named: "GPTDriver Press Home Button") { _ in }
                 XCUIDevice.shared.press(.home)
             } else {
                 var text = ""
@@ -227,6 +289,8 @@ class NativeActionExecutor {
                         text.append(char)
                     }
                 }
+                log(.info, "Typing text", metadata: ["text": text])
+                XCTContext.runActivity(named: "GPTDriver Typing Text: \(text)") { _ in }
                 self.app.typeText(text)
             }
         }
@@ -237,9 +301,11 @@ class NativeActionExecutor {
             if action.type == "pause", let duration = action.duration {
                 let nanoseconds = UInt64(duration) * 1_000_000
                 do {
+                    log(.info, "Pausing", metadata: ["durationMs": duration])
+                    XCTContext.runActivity(named: "GPTDriver Wait for \(duration)ms") { _ in }
                     try await Task.sleep(nanoseconds: nanoseconds)
                 } catch {
-                    os_log("NativeActionExecutor: Pause interrupted with error: %{public}@", log: OSLog.default, type: .error, error.localizedDescription)
+                    log(.error, "Pause interrupted", metadata: ["error": error.localizedDescription])
                 }
             }
         }
@@ -278,7 +344,7 @@ public class GptDriver {
     /// - Parameter sessionURL: The live session URL
     public var onSessionCreated: ((String) -> Void)?
     
-    var logger = OSLog(subsystem: "com.gptdriver", category: "GPTD-Client")
+    private let structuredLogger = Logger(subsystem: "com.gptdriver", category: "GPTD-Client")
     
     private lazy var customURLSession: URLSession = {
         let configuration = URLSessionConfiguration.default
@@ -297,6 +363,19 @@ public class GptDriver {
                          delegate: nil, 
                          delegateQueue: delegateQueue)
     }()
+    
+    private func log(_ level: GPTLogLevel, _ message: String, metadata: [String: Any] = [:]) {
+        let sessionId = gptDriverSessionId ?? "no-session"
+        let metadataString = metadata
+            .map { "\($0.key)=\($0.value)" }
+            .sorted()
+            .joined(separator: ", ")
+        if metadataString.isEmpty {
+            structuredLogger.log(level: level.osLogType, "[gptdriver][session:\(sessionId)] \(message, privacy: .public)")
+        } else {
+            structuredLogger.log(level: level.osLogType, "[gptdriver][session:\(sessionId)] \(message, privacy: .public) | \(metadataString, privacy: .public)")
+        }
+    }
     
     // MARK: - Initializer
     private init(apiKey: String,
@@ -357,9 +436,25 @@ public class GptDriver {
             throw GPTDriverError.missingSessionId
         }
         
+        XCTContext.runActivity(named: "GPTDriver Execute: \(command)") { _ in }
+
         var isDone = false
+        var iteration = 1
         while !isDone {
+            let currentIteration = iteration
+            log(.info, "Execute iteration started", metadata: [
+                "iteration": currentIteration,
+                "command": command
+            ])
             let screenshotBase64 = try await takeScreenshotBase64()
+
+            XCTContext.runActivity(named: "GPTDriver take screenshot & query API for next action #\(currentIteration)") { activity in
+                let screenshot = XCUIScreen.main.screenshot()
+                let attachment = XCTAttachment(screenshot: screenshot)
+                attachment.name = "Screenshot"
+                attachment.lifetime = .keepAlways
+                activity.add(attachment)
+            }
             
             let requestBody: [String: Any] = [
                 "api_key": apiKey,
@@ -375,11 +470,24 @@ public class GptDriver {
             let responseData = try await postJson(to: requestUrl, jsonObject: requestBody)
             
             let executeResponse = try JSONDecoder().decode(ExecuteResponse.self, from: responseData)
+            log(.info, "Execute iteration response", metadata: [
+                "iteration": currentIteration,
+                "status": executeResponse.status,
+                "commandCount": executeResponse.commands.count
+            ])
             
             switch executeResponse.status {
             case "failed":
-                let details = "\(String(describing: executeResponse.commands))"
-                throw GPTDriverError.executionFailed("GPT Driver reported execution failed. " + details)
+                let errorMessages = executeResponse.commands.compactMap { command -> String? in
+                    guard let data = command.data, let value = data["value"] as? String else { return nil }
+                    return value
+                }
+                let errorMessage = errorMessages.joined(separator: "; ")
+                log(.error, "Execute iteration failed", metadata: [
+                    "iteration": currentIteration,
+                    "errorMessage": errorMessage
+                ])
+                throw GPTDriverError.executionFailed(errorMessage.isEmpty ? "GPT Driver execution failed" : errorMessage)
             case "inProgress":
                 try await processCommands(executeResponse.commands)
             default:
@@ -388,9 +496,14 @@ public class GptDriver {
             }
             
             if !isDone {
+                log(.info, "Execute waiting before next iteration", metadata: [
+                    "currentIteration": currentIteration
+                ])
+                iteration += 1
                 try await Task.sleep(nanoseconds: 1_500_000_000)
             }
         }
+        log(.info, "Execute completed", metadata: ["iterations": iteration])
     }
     
     // MARK: - Session Management
@@ -477,9 +590,36 @@ public class GptDriver {
             throw GPTDriverError.invalidResponse
         }
         let sessionURL = "https://app.mobileboost.io/gpt-driver/sessions/\(sessionId)"
-        os_log("Live Session View: %@", log: OSLog.default, type: .info, sessionURL)
+        log(.notice, "Live Session View", metadata: ["sessionURL": sessionURL])
         self.gptDriverSessionId = sessionId
         self.sessionURL = sessionURL
+
+        XCTContext.runActivity(named: "GPTDriver Live Session URL") { activity in
+            if let url = URL(string: sessionURL) {
+                let tempDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+                let fileName = "gptd-session-link.webloc"
+                let fileURL = tempDirectory.appendingPathComponent(fileName)
+                let weblocPayload = ["URL": url.absoluteString]
+
+                if let data = try? PropertyListSerialization.data(fromPropertyList: weblocPayload,
+                                                                  format: .xml,
+                                                                  options: 0) {
+                    do {
+                        try data.write(to: fileURL, options: [.atomic])
+                        let linkAttachment = XCTAttachment(contentsOfFile: fileURL)
+                        linkAttachment.name = "GPTDriver Session URL Link"
+                        linkAttachment.lifetime = .keepAlways
+                        linkAttachment.userInfo = ["link": url.absoluteString]
+                        activity.add(linkAttachment)
+                    } catch {
+                        log(.warning, "Failed to persist live session link attachment",
+                            metadata: ["error": error.localizedDescription])
+                    }
+
+                    try? FileManager.default.removeItem(at: fileURL)
+                }
+            }
+        }
         
         // Notify callback if provided
         onSessionCreated?(sessionURL)
@@ -494,7 +634,8 @@ public class GptDriver {
                let type = firstAction["type"] as? String,
                type == "pause",
                let duration = firstAction["duration"] as? Int {
-                os_log("Executing pause for %{public}d seconds", log: logger, type: .info, duration)
+                log(.info, "Executing pause", metadata: ["durationSeconds": duration])
+                XCTContext.runActivity(named: "GPTDriver Wait for \(duration)s") { _ in }
                 try await Task.sleep(nanoseconds: UInt64(duration) * 1_000_000_000)
                 continue
             }
@@ -505,11 +646,15 @@ public class GptDriver {
                 guard let nativeApp = self.nativeApp else {
                     throw GPTDriverError.executionFailed("No native XCUIApplication provided in native mode")
                 }
-                let executor = NativeActionExecutor(app: nativeApp)
+                let executor = NativeActionExecutor(app: nativeApp,
+                                                    logger: structuredLogger,
+                                                    sessionIdProvider: { [weak self] in
+                                                        self?.gptDriverSessionId
+                                                    })
                 if let data = command.data {
                     await executor.executeCommand(with: data)
                 } else {
-                    os_log("processCommands: Missing command data for command: %@", log: OSLog.default, type: .error, command.url)
+                    log(.error, "processCommands missing command data", metadata: ["endpoint": command.url])
                 }
             }
         }
@@ -541,14 +686,18 @@ public class GptDriver {
                 
                 if 200..<300 ~= httpResponse.statusCode {
                     if attempt > 0 {
-                        os_log("Request succeeded on attempt %d", log: logger, type: .info, attempt + 1)
+                        log(.info, "Request succeeded after retry", metadata: ["attempt": attempt + 1])
                     }
                     return data
                 }
                 
                 if shouldRetry(statusCode: httpResponse.statusCode) && attempt < maxRetries - 1 {
                     let delay = exponentialBackoff(attempt: attempt)
-                    os_log("Request failed with status %d, retrying after %f seconds", log: logger, type: .info, httpResponse.statusCode, delay)
+                    log(.info, "Request failed with retryable status", metadata: [
+                        "statusCode": httpResponse.statusCode,
+                        "retryDelay": delay,
+                        "attempt": attempt + 1
+                    ])
                     try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     continue
                 }
@@ -556,11 +705,19 @@ public class GptDriver {
                 throw GPTDriverError.invalidResponse
             } catch let error as URLError {
                 lastError = error
-                os_log("Network error: %@ (code: %d)", log: logger, type: .error, error.localizedDescription, error.code.rawValue)
+                log(.error, "Network error", metadata: [
+                    "code": error.code.rawValue,
+                    "description": error.localizedDescription,
+                    "attempt": attempt + 1
+                ])
                 
                 if shouldRetryURLError(error) && attempt < maxRetries - 1 {
                     let delay = exponentialBackoff(attempt: attempt)
-                    os_log("Retrying after %f seconds due to: %@", log: logger, type: .info, delay, error.localizedDescription)
+                    log(.info, "Retrying after network error", metadata: [
+                        "retryDelay": delay,
+                        "description": error.localizedDescription,
+                        "attempt": attempt + 1
+                    ])
                     try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     continue
                 }
@@ -633,10 +790,7 @@ public class GptDriver {
     // MARK: - Screenshot Helper
     private func takeScreenshotBase64() async throws -> String {
         if appiumServerUrl == nil {
-            guard let app = nativeApp else {
-                throw GPTDriverError.invalidResponse
-            }
-            let screenshot = await app.windows.firstMatch.screenshot()
+            let screenshot = await XCUIScreen.main.screenshot()
             return await screenshot.pngRepresentation.base64EncodedString()
         } else {
             let screenshot = await XCUIScreen.main.screenshot()
@@ -693,14 +847,23 @@ public class GptDriver {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
+        log(.info, "Assert start", metadata: [
+            "assertion": assertion,
+            "maxRetries": maxRetries,
+            "retryDelaySeconds": retryDelay
+        ])
         
         do {
             let results = try await checkBulk([assertion], maxRetries: maxRetries, retryDelay: retryDelay)
             guard let firstResult = results.values.first, firstResult else {
+                let message = "Failed assertion: \(assertion)"
+                log(.error, "Assert failed", metadata: ["assertion": assertion])
                 try await setSessionStatus(status: "failed")
-                throw GPTDriverError.executionFailed("Failed assertion: \(assertion)")
+                throw GPTDriverError.executionFailed(message)
             }
+            log(.info, "Assert passed", metadata: ["assertion": assertion])
         } catch {
+            log(.error, "Assert threw error", metadata: ["error": error.localizedDescription, "assertion": assertion])
             try await setSessionStatus(status: "failed")
             throw error
         }
@@ -716,6 +879,11 @@ public class GptDriver {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
+        log(.info, "AssertBulk start", metadata: [
+            "count": assertions.count,
+            "maxRetries": maxRetries,
+            "retryDelaySeconds": retryDelay
+        ])
         
         do {
             let results = try await checkBulk(assertions, maxRetries: maxRetries, retryDelay: retryDelay)
@@ -728,10 +896,18 @@ public class GptDriver {
             }
             
             if !failedAssertions.isEmpty {
+                let message = "Failed assertions: \(failedAssertions.joined(separator: ", "))"
+                log(.error, "AssertBulk failed", metadata: [
+                    "failedCount": failedAssertions.count
+                ])
                 try await setSessionStatus(status: "failed")
-                throw GPTDriverError.executionFailed("Failed assertions: \(failedAssertions.joined(separator: ", "))")
+                throw GPTDriverError.executionFailed(message)
             }
+            log(.info, "AssertBulk passed", metadata: ["count": assertions.count])
         } catch {
+            log(.error, "AssertBulk threw error", metadata: [
+                "error": error.localizedDescription
+            ])
             try await setSessionStatus(status: "failed")
             throw error
         }
@@ -749,13 +925,18 @@ public class GptDriver {
             try await startSession()
         }
         
-        os_log("Checking: %{public}@", log: logger, type: .info, conditions)
+        log(.info, "Checking conditions", metadata: [
+            "count": conditions.count,
+            "maxRetries": maxRetries,
+            "retryDelaySeconds": retryDelay
+        ])
         
         var lastError: Error?
         var lastResults: [String: Bool]?
         
         for attempt in 0...maxRetries {
             do {
+                log(.info, "Check attempt started", metadata: ["attempt": attempt + 1])
                 // Take a screenshot using XCUI instead of Appium
                 let screenshotBase64 = try await takeScreenshotBase64()
                 
@@ -786,32 +967,45 @@ public class GptDriver {
                 let allPassed = results.values.allSatisfy { $0 }
                 
                 if allPassed {
-                    if attempt > 0 {
-                        os_log("Check succeeded on attempt %d", log: logger, type: .info, attempt + 1)
-                    }
+                    log(.info, "Check succeeded", metadata: ["attempt": attempt + 1])
                     return results
                 }
                 
                 // Some conditions failed
                 if attempt < maxRetries {
                     let failedConditions = results.filter { !$0.value }.keys.joined(separator: ", ")
-                    os_log("Check failed on attempt %d (failed: %{public}@), retrying after %.1f seconds...", log: logger, type: .info, attempt + 1, failedConditions, retryDelay)
+                    log(.info, "Check failed will retry", metadata: [
+                        "attempt": attempt + 1,
+                        "failedConditions": failedConditions,
+                        "retryDelaySeconds": retryDelay
+                    ])
                     try await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
                     continue
                 }
                 
                 // All retries exhausted, return the last results (with failures)
+                log(.error, "Check exhausted retries with failures", metadata: [
+                    "attempts": attempt + 1
+                ])
                 return results
                 
             } catch {
                 lastError = error
                 
                 if attempt < maxRetries {
-                    os_log("Check error on attempt %d: %@, retrying after %.1f seconds...", log: logger, type: .info, attempt + 1, error.localizedDescription, retryDelay)
+                    log(.warning, "Check error will retry", metadata: [
+                        "attempt": attempt + 1,
+                        "error": error.localizedDescription,
+                        "retryDelaySeconds": retryDelay
+                    ])
                     try await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
                     continue
                 }
                 
+                log(.error, "CheckBulk exhausted retries with error", metadata: [
+                    "attempt": attempt + 1,
+                    "error": error.localizedDescription
+                ])
                 try await setSessionStatus(status: "failed")
                 throw error
             }
@@ -829,7 +1023,7 @@ public class GptDriver {
             return
         }
         
-        os_log("Stopping session...", log: logger, type: .info)
+        log(.info, "Stopping session", metadata: ["status": status])
         
         let requestUrl = gptDriverBaseUrl
             .appendingPathComponent("sessions")
@@ -843,7 +1037,7 @@ public class GptDriver {
         
         _ = try await postJson(to: requestUrl, jsonObject: requestBody)
         
-        os_log("Session stopped", log: logger, type: .info)
+        log(.info, "Session stopped")
         appiumSessionStarted = false
         self.gptDriverSessionId = nil
         self.sessionURL = nil
@@ -854,7 +1048,7 @@ public class GptDriver {
             try await startSession()
         }
         
-        os_log("Extracting: %{public}@", log: logger, type: .info, extractions.description)
+        log(.info, "Extracting values", metadata: ["count": extractions.count])
         
         // Take a screenshot using XCUI
         let screenshotBase64 = try await takeScreenshotBase64()

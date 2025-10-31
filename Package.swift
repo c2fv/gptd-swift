@@ -5,7 +5,7 @@ import PackageDescription
 
 let package = Package(
     name: "gptd-swift",
-    platforms: [.iOS(.v13)],
+    platforms: [.iOS(.v14)],
     products: [
         .library(
             name: "gptd-swift",
