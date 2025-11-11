@@ -446,10 +446,12 @@ public class GptDriver {
                 "iteration": currentIteration,
                 "command": command
             ])
-            let screenshotBase64 = try await takeScreenshotBase64()
-
+            // Take screenshot once and reuse for both API call and test attachment
+            // This prevents race conditions and ensures consistency
+            let screenshot = await XCUIScreen.main.screenshot()
+            let screenshotBase64 = try await screenshotToBase64(screenshot: screenshot)
+            
             XCTContext.runActivity(named: "GPTDriver take screenshot & query API for next action #\(currentIteration)") { activity in
-                let screenshot = XCUIScreen.main.screenshot()
                 let attachment = XCTAttachment(screenshot: screenshot)
                 attachment.name = "Screenshot"
                 attachment.lifetime = .keepAlways
@@ -789,11 +791,14 @@ public class GptDriver {
     
     // MARK: - Screenshot Helper
     private func takeScreenshotBase64() async throws -> String {
+        let screenshot = await XCUIScreen.main.screenshot()
+        return try await screenshotToBase64(screenshot: screenshot)
+    }
+    
+    private func screenshotToBase64(screenshot: XCUIScreenshot) async throws -> String {
         if appiumServerUrl == nil {
-            let screenshot = await XCUIScreen.main.screenshot()
             return await screenshot.pngRepresentation.base64EncodedString()
         } else {
-            let screenshot = await XCUIScreen.main.screenshot()
             let pngData = await screenshot.pngRepresentation
             guard let image = UIImage(data: pngData) else {
                 throw GPTDriverError.invalidResponse
