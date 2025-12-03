@@ -23,6 +23,7 @@ struct CommandAction: Decodable {
 struct ExecuteResponse: Decodable {
     let commands: [AppiumCommand]
     let status: String
+    let cache_hit: Bool
 }
 
 struct AppiumCommand: Decodable {
@@ -83,6 +84,13 @@ enum GPTDriverError: Error {
     case invalidResponse
     case missingSessionId
     case creationFailed(String)
+}
+
+/// Caching mode for GPT Driver interactions
+public enum CachingMode: String {
+    case none = "NONE"
+    case interactionRegion = "INTERACTION_REGION"
+    case fullScreen = "FULL_SCREEN"
 }
 
 enum GPTLogLevel {
@@ -191,7 +199,7 @@ class NativeActionExecutor {
         }
     }
     
-    func executeCommand(with data: [String: Any]) async {
+    func executeCommand(with data: [String: Any], cacheHit: Bool) async {
         guard let jsonData = try? JSONSerialization.data(withJSONObject: data, options: []) else {
             log(.error, "NativeActionExecutor failed to convert command data to JSON")
             return
@@ -206,23 +214,24 @@ class NativeActionExecutor {
         for group in payload.actions {
             switch group.type {
             case "pointer":
-                await executePointerActions(group.actions)
+                await executePointerActions(group.actions, cacheHit: cacheHit)
                 do {
                     try await Task.sleep(nanoseconds: 1_500_000_000)
                 } catch {
                     log(.warning, "Sleep after pointer actions interrupted", metadata: ["error": error.localizedDescription])
                 }
             case "key":
-                await executeKeyActions(group.actions)
+                await executeKeyActions(group.actions, cacheHit: cacheHit)
             case "pause":
-                await executePauseActions(group.actions)
+                await executePauseActions(group.actions, cacheHit: cacheHit)
             default:
                 log(.error, "Unsupported action group type", metadata: ["groupType": group.type])
             }
         }
     }
     
-    private func executePointerActions(_ actions: [WebDriverAction]) async {
+    private func executePointerActions(_ actions: [WebDriverAction], cacheHit: Bool) async {
+        let cacheLabel = cacheHit ? " [cached]" : ""
         await MainActor.run {
             if actions.count == 4,
                let first = actions.first,
@@ -244,9 +253,10 @@ class NativeActionExecutor {
                 log(.info, "Pointer press", metadata: [
                     "x": x,
                     "y": y,
-                    "duration": pressDuration
+                    "duration": pressDuration,
+                    "cacheHit": cacheHit
                 ])
-                XCTContext.runActivity(named: "GPTDriver Press for \(pressDuration)s at \(x), \(y)") { _ in }
+                XCTContext.runActivity(named: "GPTDriver Press for \(pressDuration)s at \(x), \(y)\(cacheLabel)") { _ in }
                 coordinate.press(forDuration: pressDuration)
                 
             } else if actions.count == 5,
@@ -263,9 +273,10 @@ class NativeActionExecutor {
                     "startX": xStart,
                     "startY": yStart,
                     "endX": xEnd,
-                    "endY": yEnd
+                    "endY": yEnd,
+                    "cacheHit": cacheHit
                 ])
-                XCTContext.runActivity(named: "GPTDriver Drag from \(xStart), \(yStart) to \(xEnd), \(yEnd)") { _ in }
+                XCTContext.runActivity(named: "GPTDriver Drag from \(xStart), \(yStart) to \(xEnd), \(yEnd)\(cacheLabel)") { _ in }
                 startCoordinate.press(forDuration: 0.1, thenDragTo: endCoordinate)
             } else {
                 log(.error, "Unrecognized pointer actions pattern", metadata: ["actionCount": actions.count])
@@ -273,14 +284,15 @@ class NativeActionExecutor {
         }
     }
     
-    private func executeKeyActions(_ actions: [WebDriverAction]) async {
+    private func executeKeyActions(_ actions: [WebDriverAction], cacheHit: Bool) async {
+        let cacheLabel = cacheHit ? " [cached]" : ""
         await MainActor.run {
             if let first = actions.first,
                first.type == "keyDown",
                let value = first.value,
                value == "\u{e011}" {
-                log(.info, "Invoking home button")
-                XCTContext.runActivity(named: "GPTDriver Press Home Button") { _ in }
+                log(.info, "Invoking home button", metadata: ["cacheHit": cacheHit])
+                XCTContext.runActivity(named: "GPTDriver Press Home Button\(cacheLabel)") { _ in }
                 XCUIDevice.shared.press(.home)
             } else {
                 var text = ""
@@ -289,20 +301,21 @@ class NativeActionExecutor {
                         text.append(char)
                     }
                 }
-                log(.info, "Typing text", metadata: ["text": text])
-                XCTContext.runActivity(named: "GPTDriver Typing Text: \(text)") { _ in }
+                log(.info, "Typing text", metadata: ["text": text, "cacheHit": cacheHit])
+                XCTContext.runActivity(named: "GPTDriver Typing Text: \(text)\(cacheLabel)") { _ in }
                 self.app.typeText(text)
             }
         }
     }
     
-    private func executePauseActions(_ actions: [WebDriverAction]) async {
+    private func executePauseActions(_ actions: [WebDriverAction], cacheHit: Bool) async {
+        let cacheLabel = cacheHit ? " [cached]" : ""
         for action in actions {
             if action.type == "pause", let duration = action.duration {
                 let nanoseconds = UInt64(duration) * 1_000_000
                 do {
-                    log(.info, "Pausing", metadata: ["durationMs": duration])
-                    XCTContext.runActivity(named: "GPTDriver Wait for \(duration)ms") { _ in }
+                    log(.info, "Pausing", metadata: ["durationMs": duration, "cacheHit": cacheHit])
+                    XCTContext.runActivity(named: "GPTDriver Wait for \(duration)ms\(cacheLabel)") { _ in }
                     try await Task.sleep(nanoseconds: nanoseconds)
                 } catch {
                     log(.error, "Pause interrupted", metadata: ["error": error.localizedDescription])
@@ -338,6 +351,10 @@ public class GptDriver {
     private let gptDriverBaseUrl: URL
     private var gptDriverSessionId: String?
     public private(set) var sessionURL: String?
+    
+    private let cachingMode: CachingMode
+    private let testId: String
+    private var stepCounter: Int = 1
     
     /// Optional callback that is invoked when a new session is created.
     /// Use this to capture the session URL for logging, attachments, or custom handling.
@@ -383,13 +400,17 @@ public class GptDriver {
                   deviceName: String? = nil,
                   platform: String? = nil,
                   platformVersion: String? = nil,
-                  nativeApp: XCUIApplication? = nil) {
+                  nativeApp: XCUIApplication? = nil,
+                  cachingMode: CachingMode = .none,
+                  testId: String = "") {
         self.apiKey = apiKey
         self.appiumServerUrl = appiumServerUrl
         self.deviceName = deviceName
         self.platform = platform
         self.platformVersion = platformVersion
         self.gptDriverBaseUrl = URL(string: "https://api.mobileboost.io")!
+        self.cachingMode = cachingMode
+        self.testId = testId
         
         if appiumServerUrl == nil {
             self.nativeApp = nativeApp ?? XCUIApplication()
@@ -402,9 +423,13 @@ public class GptDriver {
     /// - Parameters:
     ///   - apiKey: Your GPT Driver API key.
     ///   - nativeApp: The XCUIApplication instance representing the app under test. Defaults to `XCUIApplication()`
+    ///   - cachingMode: The caching mode to use for interactions. Defaults to `.none`
+    ///   - testId: Optional test identifier used for cache matching. Defaults to empty string.
     public convenience init(apiKey: String,
-                            nativeApp: XCUIApplication = XCUIApplication()) {
-        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp)
+                            nativeApp: XCUIApplication = XCUIApplication(),
+                            cachingMode: CachingMode = .none,
+                            testId: String = "") {
+        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId)
     }
     
     /// Initializes GptDriver for execution via a remote Appium server.
@@ -414,12 +439,16 @@ public class GptDriver {
     ///   - deviceName: The name of the target device (e.g., "iPhone 15 Pro").
     ///   - platform: The target platform (e.g., "iOS").
     ///   - platformVersion: The OS version of the target device (e.g., "18.2").
+    ///   - cachingMode: The caching mode to use for interactions. Defaults to `.none`
+    ///   - testId: Optional test identifier used for cache matching. Defaults to empty string.
     public convenience init(apiKey: String,
                             appiumServerUrl: URL,
                             deviceName: String,
                             platform: String,
-                            platformVersion: String) {
-        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil)
+                            platformVersion: String,
+                            cachingMode: CachingMode = .none,
+                            testId: String = "") {
+        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil, cachingMode: cachingMode, testId: testId)
     }
     
     deinit {
@@ -427,7 +456,11 @@ public class GptDriver {
     }
     
     // MARK: - Public Methods
-    public func execute(_ command: String) async throws {
+    /// Executes a command using GPT Driver.
+    /// - Parameters:
+    ///   - command: The command to execute
+    ///   - cachingMode: Optional caching mode that overrides the global setting for this execution
+    public func execute(_ command: String, cachingMode: CachingMode? = nil) async throws {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
@@ -435,6 +468,11 @@ public class GptDriver {
         guard let gptDriverSessionId = gptDriverSessionId else {
             throw GPTDriverError.missingSessionId
         }
+        
+        let effectiveCachingMode = cachingMode ?? self.cachingMode
+        
+        let currentStep = stepCounter
+        stepCounter += 1
         
         XCTContext.runActivity(named: "GPTDriver Execute: \(command)") { _ in }
 
@@ -444,7 +482,9 @@ public class GptDriver {
             let currentIteration = iteration
             log(.info, "Execute iteration started", metadata: [
                 "iteration": currentIteration,
-                "command": command
+                "command": command,
+                "stepCounter": currentStep,
+                "caching_mode": effectiveCachingMode.rawValue
             ])
             // Take screenshot once and reuse for both API call and test attachment
             // This prevents race conditions and ensures consistency
@@ -461,7 +501,9 @@ public class GptDriver {
             let requestBody: [String: Any] = [
                 "api_key": apiKey,
                 "command": command,
-                "base64_screenshot": screenshotBase64
+                "base64_screenshot": screenshotBase64,
+                "step_counter": currentStep,
+                "caching_mode": effectiveCachingMode.rawValue
             ]
             
             let requestUrl = gptDriverBaseUrl
@@ -475,7 +517,8 @@ public class GptDriver {
             log(.info, "Execute iteration response", metadata: [
                 "iteration": currentIteration,
                 "status": executeResponse.status,
-                "commandCount": executeResponse.commands.count
+                "commandCount": executeResponse.commands.count,
+                "cache_hit": executeResponse.cache_hit
             ])
             
             switch executeResponse.status {
@@ -487,13 +530,14 @@ public class GptDriver {
                 let errorMessage = errorMessages.joined(separator: "; ")
                 log(.error, "Execute iteration failed", metadata: [
                     "iteration": currentIteration,
-                    "errorMessage": errorMessage
+                    "errorMessage": errorMessage,
+                    "cache_hit": executeResponse.cache_hit
                 ])
                 throw GPTDriverError.executionFailed(errorMessage.isEmpty ? "GPT Driver execution failed" : errorMessage)
             case "inProgress":
-                try await processCommands(executeResponse.commands)
+                try await processCommands(executeResponse.commands, cacheHit: executeResponse.cache_hit)
             default:
-                try await processCommands(executeResponse.commands)
+                try await processCommands(executeResponse.commands, cacheHit: executeResponse.cache_hit)
                 isDone = true
             }
             
@@ -580,7 +624,9 @@ public class GptDriver {
                 "os": platformVersion ?? ""
             ],
             "use_internal_virtual_device": false,
-            "build_id": ""
+            "build_id": "",
+            "test_id": testId,
+            "caching_mode": cachingMode.rawValue
         ]
         
         let responseData = try await postJson(to: url, jsonObject: body)
@@ -628,7 +674,8 @@ public class GptDriver {
     }
     
     // MARK: - Command Processing
-    private func processCommands(_ commands: [AppiumCommand]) async throws {
+    private func processCommands(_ commands: [AppiumCommand], cacheHit: Bool) async throws {
+        let cacheLabel = cacheHit ? " [cached]" : ""
         for command in commands {
             if let data = command.data,
                let actions = data["actions"] as? [[String: Any]],
@@ -636,8 +683,8 @@ public class GptDriver {
                let type = firstAction["type"] as? String,
                type == "pause",
                let duration = firstAction["duration"] as? Int {
-                log(.info, "Executing pause", metadata: ["durationSeconds": duration])
-                XCTContext.runActivity(named: "GPTDriver Wait for \(duration)s") { _ in }
+                log(.info, "Executing pause", metadata: ["durationSeconds": duration, "cacheHit": cacheHit])
+                XCTContext.runActivity(named: "GPTDriver Wait for \(duration)s\(cacheLabel)") { _ in }
                 try await Task.sleep(nanoseconds: UInt64(duration) * 1_000_000_000)
                 continue
             }
@@ -654,7 +701,7 @@ public class GptDriver {
                                                         self?.gptDriverSessionId
                                                     })
                 if let data = command.data {
-                    await executor.executeCommand(with: data)
+                    await executor.executeCommand(with: data, cacheHit: cacheHit)
                 } else {
                     log(.error, "processCommands missing command data", metadata: ["endpoint": command.url])
                 }
@@ -852,6 +899,7 @@ public class GptDriver {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
+        
         log(.info, "Assert start", metadata: [
             "assertion": assertion,
             "maxRetries": maxRetries,
@@ -884,6 +932,7 @@ public class GptDriver {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
+        
         log(.info, "AssertBulk start", metadata: [
             "count": assertions.count,
             "maxRetries": maxRetries,
@@ -930,10 +979,15 @@ public class GptDriver {
             try await startSession()
         }
         
+        let currentStep = stepCounter
+        stepCounter += 1
+        
         log(.info, "Checking conditions", metadata: [
             "count": conditions.count,
             "maxRetries": maxRetries,
-            "retryDelaySeconds": retryDelay
+            "retryDelaySeconds": retryDelay,
+            "stepCounter": currentStep,
+            "caching_mode": cachingMode.rawValue
         ])
         
         var lastError: Error?
@@ -942,8 +996,9 @@ public class GptDriver {
         for attempt in 0...maxRetries {
             do {
                 log(.info, "Check attempt started", metadata: ["attempt": attempt + 1])
-                // Take a screenshot using XCUI instead of Appium
-                let screenshotBase64 = try await takeScreenshotBase64()
+                // Take a screenshot and reuse for both API call and test attachment
+                let screenshot = await XCUIScreen.main.screenshot()
+                let screenshotBase64 = try await screenshotToBase64(screenshot: screenshot)
                 
                 // Build request to GPT Driver API
                 let requestUrl = gptDriverBaseUrl
@@ -955,7 +1010,9 @@ public class GptDriver {
                     "api_key": apiKey,
                     "base64_screenshot": screenshotBase64,
                     "assertions": conditions,
-                    "command": "Assert: \(String(describing: try? JSONSerialization.data(withJSONObject: conditions, options: [])))"
+                    "command": "Assert: \(String(describing: try? JSONSerialization.data(withJSONObject: conditions, options: [])))",
+                    "step_counter": currentStep,
+                    "caching_mode": cachingMode.rawValue
                 ]
                 
                 let responseData = try await postJson(to: requestUrl, jsonObject: requestBody)
@@ -966,13 +1023,22 @@ public class GptDriver {
                     throw GPTDriverError.invalidResponse
                 }
                 
+                let cacheHit = json["cache_hit"] as? Bool ?? false
+                let cacheLabel = cacheHit ? " [cached]" : ""
+                
                 lastResults = results
                 
                 // Check if all conditions passed
                 let allPassed = results.values.allSatisfy { $0 }
                 
                 if allPassed {
-                    log(.info, "Check succeeded", metadata: ["attempt": attempt + 1])
+                    log(.info, "Check succeeded", metadata: ["attempt": attempt + 1, "cacheHit": cacheHit])
+                    XCTContext.runActivity(named: "GPTDriver Assert passed\(cacheLabel)") { activity in
+                        let attachment = XCTAttachment(screenshot: screenshot)
+                        attachment.name = "Screenshot"
+                        attachment.lifetime = .keepAlways
+                        activity.add(attachment)
+                    }
                     return results
                 }
                 
@@ -982,16 +1048,30 @@ public class GptDriver {
                     log(.info, "Check failed will retry", metadata: [
                         "attempt": attempt + 1,
                         "failedConditions": failedConditions,
-                        "retryDelaySeconds": retryDelay
+                        "retryDelaySeconds": retryDelay,
+                        "cacheHit": cacheHit
                     ])
+                    XCTContext.runActivity(named: "GPTDriver Assert failed, retrying\(cacheLabel)") { activity in
+                        let attachment = XCTAttachment(screenshot: screenshot)
+                        attachment.name = "Screenshot"
+                        attachment.lifetime = .keepAlways
+                        activity.add(attachment)
+                    }
                     try await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
                     continue
                 }
                 
                 // All retries exhausted, return the last results (with failures)
                 log(.error, "Check exhausted retries with failures", metadata: [
-                    "attempts": attempt + 1
+                    "attempts": attempt + 1,
+                    "cacheHit": cacheHit
                 ])
+                XCTContext.runActivity(named: "GPTDriver Assert failed\(cacheLabel)") { activity in
+                    let attachment = XCTAttachment(screenshot: screenshot)
+                    attachment.name = "Screenshot"
+                    attachment.lifetime = .keepAlways
+                    activity.add(attachment)
+                }
                 return results
                 
             } catch {
@@ -1053,10 +1133,18 @@ public class GptDriver {
             try await startSession()
         }
         
-        log(.info, "Extracting values", metadata: ["count": extractions.count])
+        let currentStep = stepCounter
+        stepCounter += 1
         
-        // Take a screenshot using XCUI
-        let screenshotBase64 = try await takeScreenshotBase64()
+        log(.info, "Extracting values", metadata: [
+            "count": extractions.count,
+            "stepCounter": currentStep,
+            "caching_mode": cachingMode.rawValue
+        ])
+        
+        // Take a screenshot and reuse for both API call and test attachment
+        let screenshot = await XCUIScreen.main.screenshot()
+        let screenshotBase64 = try await screenshotToBase64(screenshot: screenshot)
         
         // Build request to GPT Driver API
         let requestUrl = gptDriverBaseUrl
@@ -1074,7 +1162,9 @@ public class GptDriver {
             "api_key": apiKey,
             "base64_screenshot": screenshotBase64,
             "extractions": extractions,
-            "command": "Extract: \(extractionsJson)"
+            "command": "Extract: \(extractionsJson)",
+            "step_counter": currentStep,
+            "caching_mode": cachingMode.rawValue
         ]
         
         let responseData = try await postJson(to: requestUrl, jsonObject: requestBody)
@@ -1083,6 +1173,20 @@ public class GptDriver {
         guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
               let results = json["results"] as? [String: Any] else {
             throw GPTDriverError.invalidResponse
+        }
+        
+        let cacheHit = json["cache_hit"] as? Bool ?? false
+        let cacheLabel = cacheHit ? " [cached]" : ""
+        
+        log(.info, "Extract completed", metadata: [
+            "count": results.count,
+            "cacheHit": cacheHit
+        ])
+        XCTContext.runActivity(named: "GPTDriver Extract completed\(cacheLabel)") { activity in
+            let attachment = XCTAttachment(screenshot: screenshot)
+            attachment.name = "Screenshot"
+            attachment.lifetime = .keepAlways
+            activity.add(attachment)
         }
         
         return results
