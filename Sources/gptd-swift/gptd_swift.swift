@@ -544,7 +544,7 @@ public class GptDriver {
         self.deviceName = deviceName
         self.platform = platform
         self.platformVersion = platformVersion
-        self.gptDriverBaseUrl = URL(string: "http://127.0.0.1:9000")!
+        self.gptDriverBaseUrl = URL(string: "https://api.mobileboost.io")!
         self.cachingMode = cachingMode
         self.testId = testId
         
