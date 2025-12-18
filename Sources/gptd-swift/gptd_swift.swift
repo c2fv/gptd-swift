@@ -210,7 +210,16 @@ class NativeActionExecutor {
             log(.error, "NativeActionExecutor failed to decode JSON payload")
             return
         }
-        
+
+        if await executeMultiPointerIfPossible(payload.actions, cacheHit: cacheHit) {
+            do {
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+            } catch {
+                log(.warning, "Sleep after multi-pointer actions interrupted", metadata: ["error": error.localizedDescription])
+            }
+            return
+        }
+
         for group in payload.actions {
             switch group.type {
             case "pointer":
@@ -229,7 +238,90 @@ class NativeActionExecutor {
             }
         }
     }
-    
+
+    // MARK: - Multi-touch (pinch) support
+    private func executeMultiPointerIfPossible(_ groups: [WebDriverActionGroup], cacheHit: Bool) async -> Bool {
+        // For now we only handle the canonical pinch payload: exactly two pointer groups.
+        guard groups.count == 2, groups.allSatisfy({ $0.type == "pointer" }) else { return false }
+
+        guard
+            let pinch = PinchSpec.from(pointerGroupActions: groups.map(\.actions))
+        else {
+            return false
+        }
+
+        let cacheLabel = cacheHit ? " [cached]" : ""
+        var handled = false
+        await MainActor.run {
+            XCTContext.runActivity(named: "GPTDriver Pinch (2-finger)\(cacheLabel)") { _ in }
+            log(.info, "Pointer pinch (standard XCUI pinch) \(cacheLabel)")
+
+            let startDist = hypot(pinch.start1.x - pinch.start2.x, pinch.start1.y - pinch.start2.y)
+            let endDist = hypot(pinch.end1.x - pinch.end2.x, pinch.end1.y - pinch.end2.y)
+
+            var scale: CGFloat
+            if startDist > 0.001 {
+                let raw = endDist / startDist
+                let dampen = 0.35
+                let damped = 1.0 + (raw - 1.0) * dampen
+                scale = CGFloat(min(max(damped, 0.75), 1.6))
+            } else {
+                scale = endDist >= startDist ? 1.35 : 0.85
+            }
+            let velocity: CGFloat = (scale >= 1.0) ? 1.0 : -1.0
+            log(.info, "Pinch params", metadata: [
+                "startDist": startDist,
+                "endDist": endDist,
+                "scale": scale,
+                "velocity": velocity
+            ])
+
+            let scaleFactor = UIScreen.main.scale
+            let centerPx = CGPoint(
+                x: (pinch.start1.x + pinch.start2.x) / 2.0,
+                y: (pinch.start1.y + pinch.start2.y) / 2.0
+            )
+            let centerPt = CGPoint(x: centerPx.x / scaleFactor, y: centerPx.y / scaleFactor)
+
+            let target = self.bestPinchTarget(near: centerPt)
+            log(.info, "Pinch target", metadata: [
+                "type": String(describing: target.elementType),
+                "identifier": target.identifier,
+                "label": target.label,
+                "centerPt": "\(centerPt.x),\(centerPt.y)",
+                "frame": NSCoder.string(for: target.frame)
+            ])
+
+            target.pinch(withScale: scale, velocity: velocity)
+            handled = true
+        }
+        return handled
+    }
+
+    private func bestPinchTarget(near center: CGPoint) -> XCUIElement {
+        let window = app.windows.firstMatch
+        let candidates = app.descendants(matching: .any).allElementsBoundByIndex
+
+        var best: XCUIElement?
+        var bestArea: CGFloat = .greatestFiniteMagnitude
+
+        for el in candidates {
+            guard el.exists, el.isHittable else { continue }
+            let f = el.frame
+            guard f.contains(center) else { continue }
+
+            let area = f.width * f.height
+            if area > 0, area < bestArea {
+                bestArea = area
+                best = el
+            }
+        }
+
+        if let best { return best }
+        if window.exists { return window }
+        return app
+    }
+
     private func executePointerActions(_ actions: [WebDriverAction], cacheHit: Bool) async {
         let cacheLabel = cacheHit ? " [cached]" : ""
         await MainActor.run {
@@ -335,6 +427,50 @@ class NativeActionExecutor {
     }
 }
 
+// MARK: - Pinch parsing + XCTest multi-touch synthesis
+
+private struct PinchSpec {
+    let start1: (x: Double, y: Double)
+    let end1: (x: Double, y: Double)
+    let start2: (x: Double, y: Double)
+    let end2: (x: Double, y: Double)
+    let pauseMs: Int
+    let moveMs: Int
+
+    static func from(pointerGroupActions groups: [[WebDriverAction]]) -> PinchSpec? {
+        guard groups.count == 2 else { return nil }
+
+        func parseFinger(_ actions: [WebDriverAction]) -> (start: (Double, Double), end: (Double, Double), pauseMs: Int, moveMs: Int)? {
+            guard actions.count == 5 else { return nil }
+            guard actions[0].type == "pointerMove",
+                  let sx = actions[0].x, let sy = actions[0].y else { return nil }
+            guard actions[1].type == "pointerDown" else { return nil }
+            guard actions[2].type == "pause",
+                  let pause = actions[2].duration else { return nil }
+            guard actions[3].type == "pointerMove",
+                  let move = actions[3].duration,
+                  let ex = actions[3].x, let ey = actions[3].y else { return nil }
+            guard actions[4].type == "pointerUp" else { return nil }
+            return ((sx, sy), (ex, ey), pause, move)
+        }
+
+        guard let f1 = parseFinger(groups[0]),
+              let f2 = parseFinger(groups[1]) else { return nil }
+
+        let pauseMs = max(f1.pauseMs, f2.pauseMs)
+        let moveMs = max(f1.moveMs, f2.moveMs)
+
+        return PinchSpec(
+            start1: (f1.start.0, f1.start.1),
+            end1: (f1.end.0, f1.end.1),
+            start2: (f2.start.0, f2.start.1),
+            end2: (f2.end.0, f2.end.1),
+            pauseMs: pauseMs,
+            moveMs: moveMs
+        )
+    }
+}
+
 // MARK: - GptDriver Class
 public class GptDriver {
     // MARK: - Properties
@@ -408,7 +544,7 @@ public class GptDriver {
         self.deviceName = deviceName
         self.platform = platform
         self.platformVersion = platformVersion
-        self.gptDriverBaseUrl = URL(string: "https://api.mobileboost.io")!
+        self.gptDriverBaseUrl = URL(string: "http://127.0.0.1:9000")!
         self.cachingMode = cachingMode
         self.testId = testId
         
