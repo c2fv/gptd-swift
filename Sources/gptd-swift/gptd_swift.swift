@@ -595,8 +595,16 @@ public class GptDriver {
     /// Executes a command using GPT Driver.
     /// - Parameters:
     ///   - command: The command to execute
+    ///   - timeout: Maximum time to wait for the command to complete (default: 600s)
     ///   - cachingMode: Optional caching mode that overrides the global setting for this execution
-    public func execute(_ command: String, cachingMode: CachingMode? = nil) async throws {
+    public func execute(_ command: String, timeout: TimeInterval = 600, cachingMode: CachingMode? = nil) throws {
+        try performSync(timeout: timeout) {
+            try await self._executeAsync(command, cachingMode: cachingMode)
+        }
+    }
+
+    /// Internal async implementation of execute
+    private func _executeAsync(_ command: String, cachingMode: CachingMode? = nil) async throws {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
@@ -687,7 +695,7 @@ public class GptDriver {
         }
         log(.info, "Execute completed", metadata: ["iterations": iteration])
     }
-    
+
     // MARK: - Session Management
     private func startSession() async throws {
         if !appiumSessionStarted {
@@ -1026,12 +1034,20 @@ public class GptDriver {
 
     // MARK: - Assertion Methods
     /// Asserts a condition with automatic retries.
-    /// 
+    ///
     /// - Parameters:
     ///   - assertion: The condition to assert
     ///   - maxRetries: Number of retry attempts (default: 2)
     ///   - retryDelay: Delay in seconds between retries (default: 1.0)
-    public func assert(_ assertion: String, maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws {
+    ///   - timeout: Maximum time to wait for the assertion (default: 60s)
+    public func assert(_ assertion: String, maxRetries: Int = 2, retryDelay: TimeInterval = 1.0, timeout: TimeInterval = 60) throws {
+        try performSync(timeout: timeout) {
+            try await self._assertAsync(assertion, maxRetries: maxRetries, retryDelay: retryDelay)
+        }
+    }
+
+    /// Internal async implementation of assert
+    private func _assertAsync(_ assertion: String, maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
@@ -1043,17 +1059,17 @@ public class GptDriver {
         ])
         
         do {
-            let results = try await checkBulk([assertion], maxRetries: maxRetries, retryDelay: retryDelay)
+            let results = try await _checkBulkAsync([assertion], maxRetries: maxRetries, retryDelay: retryDelay)
             guard let firstResult = results.values.first, firstResult else {
                 let message = "Failed assertion: \(assertion)"
                 log(.error, "Assert failed", metadata: ["assertion": assertion])
-                try await setSessionStatus(status: "failed")
+                try await _setSessionStatusAsync(status: "failed")
                 throw GPTDriverError.executionFailed(message)
             }
             log(.info, "Assert passed", metadata: ["assertion": assertion])
         } catch {
             log(.error, "Assert threw error", metadata: ["error": error.localizedDescription, "assertion": assertion])
-            try await setSessionStatus(status: "failed")
+            try await _setSessionStatusAsync(status: "failed")
             throw error
         }
     }
@@ -1064,7 +1080,15 @@ public class GptDriver {
     ///   - assertions: Array of conditions to assert
     ///   - maxRetries: Number of retry attempts (default: 2)
     ///   - retryDelay: Delay in seconds between retries (default: 1.0)
-    public func assertBulk(_ assertions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws {
+    ///   - timeout: Maximum time to wait for the assertions (default: 60s)
+    public func assertBulk(_ assertions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0, timeout: TimeInterval = 60) throws {
+        try performSync(timeout: timeout) {
+            try await self._assertBulkAsync(assertions, maxRetries: maxRetries, retryDelay: retryDelay)
+        }
+    }
+
+    /// Internal async implementation of assertBulk
+    private func _assertBulkAsync(_ assertions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
@@ -1076,21 +1100,21 @@ public class GptDriver {
         ])
         
         do {
-            let results = try await checkBulk(assertions, maxRetries: maxRetries, retryDelay: retryDelay)
-            
+            let results = try await _checkBulkAsync(assertions, maxRetries: maxRetries, retryDelay: retryDelay)
+
             var failedAssertions: [String] = []
             for (index, result) in results.values.enumerated() {
                 if !result, index < assertions.count {
                     failedAssertions.append(assertions[index])
                 }
             }
-            
+
             if !failedAssertions.isEmpty {
                 let message = "Failed assertions: \(failedAssertions.joined(separator: ", "))"
                 log(.error, "AssertBulk failed", metadata: [
                     "failedCount": failedAssertions.count
                 ])
-                try await setSessionStatus(status: "failed")
+                try await _setSessionStatusAsync(status: "failed")
                 throw GPTDriverError.executionFailed(message)
             }
             log(.info, "AssertBulk passed", metadata: ["count": assertions.count])
@@ -1098,7 +1122,7 @@ public class GptDriver {
             log(.error, "AssertBulk threw error", metadata: [
                 "error": error.localizedDescription
             ])
-            try await setSessionStatus(status: "failed")
+            try await _setSessionStatusAsync(status: "failed")
             throw error
         }
     }
@@ -1109,8 +1133,16 @@ public class GptDriver {
     ///   - conditions: Array of conditions to check
     ///   - maxRetries: Number of retry attempts (default: 2)
     ///   - retryDelay: Delay in seconds between retries (default: 1.0)
+    ///   - timeout: Maximum time to wait for checks (default: 60s)
     /// - Returns: Dictionary mapping conditions to boolean results
-    public func checkBulk(_ conditions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws -> [String: Bool] {
+    public func checkBulk(_ conditions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0, timeout: TimeInterval = 60) throws -> [String: Bool] {
+        return try performSync(timeout: timeout) {
+            try await self._checkBulkAsync(conditions, maxRetries: maxRetries, retryDelay: retryDelay)
+        }
+    }
+
+    /// Internal async implementation of checkBulk
+    private func _checkBulkAsync(_ conditions: [String], maxRetries: Int = 2, retryDelay: TimeInterval = 1.0) async throws -> [String: Bool] {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
@@ -1227,7 +1259,7 @@ public class GptDriver {
                     "attempt": attempt + 1,
                     "error": error.localizedDescription
                 ])
-                try await setSessionStatus(status: "failed")
+                try await _setSessionStatusAsync(status: "failed")
                 throw error
             }
         }
@@ -1239,7 +1271,24 @@ public class GptDriver {
         throw lastError ?? GPTDriverError.invalidResponse
     }
 
-    public func setSessionStatus(status: String) async throws {
+    /// Marks the session as succeeded.
+    /// - Parameter timeout: Maximum time to wait (default: 15s)
+    public func setSessionSucceeded(timeout: TimeInterval = 15) throws {
+        try performSync(timeout: timeout) {
+            try await self._setSessionStatusAsync(status: "success")
+        }
+    }
+
+    /// Marks the session as failed.
+    /// - Parameter timeout: Maximum time to wait (default: 15s)
+    public func setSessionFailed(timeout: TimeInterval = 15) throws {
+        try performSync(timeout: timeout) {
+            try await self._setSessionStatusAsync(status: "failed")
+        }
+    }
+
+    /// Internal async implementation of setSessionStatus
+    private func _setSessionStatusAsync(status: String) async throws {
         guard let gptDriverSessionId = gptDriverSessionId else {
             return
         }
@@ -1264,7 +1313,19 @@ public class GptDriver {
         self.sessionURL = nil
     }
     
-    public func extract(_ extractions: [String]) async throws -> [String: Any] {
+    /// Extracts values from the screen.
+    /// - Parameters:
+    ///   - extractions: List of items to extract
+    ///   - timeout: Maximum time to wait for extraction (default: 60s)
+    /// - Returns: Dictionary of extracted values
+    public func extract(_ extractions: [String], timeout: TimeInterval = 60) throws -> [String: Any] {
+        return try performSync(timeout: timeout) {
+            try await self._extractAsync(extractions)
+        }
+    }
+
+    /// Internal async implementation of extract
+    private func _extractAsync(_ extractions: [String]) async throws -> [String: Any] {
         if !appiumSessionStarted || gptDriverSessionId == nil {
             try await startSession()
         }
@@ -1327,6 +1388,40 @@ public class GptDriver {
         
         return results
     }
+
+    // MARK: - Synchronous Execution Helper
+    /// Internal helper to execute async operations synchronously
+    private func performSync<T>(timeout: TimeInterval, operation: @escaping () async throws -> T) throws -> T {
+        let expectation = XCTestExpectation(description: "GptDriver sync operation")
+        var result: Result<T, Error>?
+
+        Task {
+            do {
+                let value = try await operation()
+                result = .success(value)
+            } catch {
+                result = .failure(error)
+            }
+            expectation.fulfill()
+        }
+
+        let waiterResult = XCTWaiter.wait(for: [expectation], timeout: timeout)
+
+        switch waiterResult {
+        case .completed:
+            guard let result = result else {
+                throw GPTDriverError.executionFailed("Operation completed but no result found")
+            }
+            switch result {
+            case .success(let value): return value
+            case .failure(let error): throw error
+            }
+        case .timedOut:
+            throw GPTDriverError.executionFailed("Operation timed out after \(timeout) seconds")
+        default:
+            throw GPTDriverError.executionFailed("Operation failed with waiter result: \(waiterResult)")
+        }
+    }
 }
 
 // MARK: - UIImage Resize Extension
@@ -1341,3 +1436,4 @@ extension UIImage {
         }
     }
 }
+
