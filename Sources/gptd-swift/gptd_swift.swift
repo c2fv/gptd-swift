@@ -696,6 +696,178 @@ public class GptDriver {
         log(.info, "Execute completed", metadata: ["iterations": iteration])
     }
 
+    // MARK: - Native-First with AI Fallback
+
+    /// Ensures a GPTDriver session is active (synchronously).
+    /// Call before attempting native XCUI code so the session exists for tracking.
+    private func ensureSession(timeout: TimeInterval = 30) throws {
+        if appiumSessionStarted && gptDriverSessionId != nil { return }
+        try performSync(timeout: timeout) {
+            try await self.startSession()
+        }
+    }
+
+    /// Executes a command, trying native XCUITest code first and falling back to AI execution on failure.
+    ///
+    /// - Parameters:
+    ///   - command: The natural-language command used as AI fallback
+    ///   - nativeAction: A closure containing native XCUITest code to attempt first
+    ///   - timeout: Maximum time to wait for the command to complete (default: 600s)
+    ///   - cachingMode: Optional caching mode that overrides the global setting for this execution
+    public func execute(_ command: String,
+                        nativeAction: () throws -> Void,
+                        timeout: TimeInterval = 600,
+                        cachingMode: CachingMode? = nil) throws {
+        try ensureSession(timeout: timeout)
+
+        log(.info, "Native execute attempt", metadata: ["command": command])
+        var nativeError: Error?
+        XCTContext.runActivity(named: "GPTDriver Native Execute: \(command)") { _ in
+            do {
+                try nativeAction()
+            } catch {
+                nativeError = error
+            }
+        }
+
+        if let error = nativeError {
+            log(.warning, "Native execute failed, falling back to AI", metadata: [
+                "command": command,
+                "nativeError": error.localizedDescription
+            ])
+            XCTContext.runActivity(named: "GPTDriver Native Failed, AI Fallback: \(command)") { _ in }
+            try performSync(timeout: timeout) {
+                try await self._executeAsync(command, cachingMode: cachingMode)
+            }
+        } else {
+            log(.info, "Native execute succeeded", metadata: ["command": command])
+            XCTContext.runActivity(named: "GPTDriver Native Execute Succeeded: \(command)") { _ in }
+        }
+    }
+
+    /// Asserts a condition, trying native XCUITest code first and falling back to AI assertion on failure.
+    ///
+    /// - Parameters:
+    ///   - assertion: The natural-language assertion used as AI fallback
+    ///   - nativeAction: A closure containing native XCUITest assertion code to attempt first
+    ///   - maxRetries: Number of retry attempts for the AI fallback (default: 2)
+    ///   - retryDelay: Delay in seconds between retries for the AI fallback (default: 1.0)
+    ///   - timeout: Maximum time to wait for the assertion (default: 60s)
+    public func assert(_ assertion: String,
+                       nativeAction: () throws -> Void,
+                       maxRetries: Int = 2,
+                       retryDelay: TimeInterval = 1.0,
+                       timeout: TimeInterval = 60) throws {
+        try ensureSession(timeout: timeout)
+
+        log(.info, "Native assert attempt", metadata: ["assertion": assertion])
+        var nativeError: Error?
+        XCTContext.runActivity(named: "GPTDriver Native Assert: \(assertion)") { _ in
+            do {
+                try nativeAction()
+            } catch {
+                nativeError = error
+            }
+        }
+
+        if let error = nativeError {
+            log(.warning, "Native assert failed, falling back to AI", metadata: [
+                "assertion": assertion,
+                "nativeError": error.localizedDescription
+            ])
+            XCTContext.runActivity(named: "GPTDriver Native Assert Failed, AI Fallback: \(assertion)") { _ in }
+            try performSync(timeout: timeout) {
+                try await self._assertAsync(assertion, maxRetries: maxRetries, retryDelay: retryDelay)
+            }
+        } else {
+            log(.info, "Native assert succeeded", metadata: ["assertion": assertion])
+            XCTContext.runActivity(named: "GPTDriver Native Assert Succeeded: \(assertion)") { _ in }
+        }
+    }
+
+    /// Asserts multiple conditions, trying native XCUITest code first and falling back to AI assertions on failure.
+    ///
+    /// - Parameters:
+    ///   - assertions: Array of natural-language assertions used as AI fallback
+    ///   - nativeAction: A closure containing native XCUITest assertion code to attempt first
+    ///   - maxRetries: Number of retry attempts for the AI fallback (default: 2)
+    ///   - retryDelay: Delay in seconds between retries for the AI fallback (default: 1.0)
+    ///   - timeout: Maximum time to wait for the assertions (default: 60s)
+    public func assertBulk(_ assertions: [String],
+                           nativeAction: () throws -> Void,
+                           maxRetries: Int = 2,
+                           retryDelay: TimeInterval = 1.0,
+                           timeout: TimeInterval = 60) throws {
+        try ensureSession(timeout: timeout)
+
+        log(.info, "Native assertBulk attempt", metadata: ["count": assertions.count])
+        var nativeError: Error?
+        XCTContext.runActivity(named: "GPTDriver Native AssertBulk (\(assertions.count) conditions)") { _ in
+            do {
+                try nativeAction()
+            } catch {
+                nativeError = error
+            }
+        }
+
+        if let error = nativeError {
+            log(.warning, "Native assertBulk failed, falling back to AI", metadata: [
+                "count": assertions.count,
+                "nativeError": error.localizedDescription
+            ])
+            XCTContext.runActivity(named: "GPTDriver Native AssertBulk Failed, AI Fallback") { _ in }
+            try performSync(timeout: timeout) {
+                try await self._assertBulkAsync(assertions, maxRetries: maxRetries, retryDelay: retryDelay)
+            }
+        } else {
+            log(.info, "Native assertBulk succeeded", metadata: ["count": assertions.count])
+            XCTContext.runActivity(named: "GPTDriver Native AssertBulk Succeeded (\(assertions.count) conditions)") { _ in }
+        }
+    }
+
+    /// Checks multiple conditions, trying native XCUITest code first and falling back to AI checks on failure.
+    ///
+    /// - Parameters:
+    ///   - conditions: Array of natural-language conditions used as AI fallback
+    ///   - nativeAction: A closure containing native XCUITest check code to attempt first.
+    ///     If the closure succeeds, all conditions are assumed to be `true`.
+    ///   - maxRetries: Number of retry attempts for the AI fallback (default: 2)
+    ///   - retryDelay: Delay in seconds between retries for the AI fallback (default: 1.0)
+    ///   - timeout: Maximum time to wait for checks (default: 60s)
+    /// - Returns: Dictionary mapping conditions to boolean results
+    public func checkBulk(_ conditions: [String],
+                          nativeAction: () throws -> Void,
+                          maxRetries: Int = 2,
+                          retryDelay: TimeInterval = 1.0,
+                          timeout: TimeInterval = 60) throws -> [String: Bool] {
+        try ensureSession(timeout: timeout)
+
+        log(.info, "Native checkBulk attempt", metadata: ["count": conditions.count])
+        var nativeError: Error?
+        XCTContext.runActivity(named: "GPTDriver Native CheckBulk (\(conditions.count) conditions)") { _ in
+            do {
+                try nativeAction()
+            } catch {
+                nativeError = error
+            }
+        }
+
+        if let error = nativeError {
+            log(.warning, "Native checkBulk failed, falling back to AI", metadata: [
+                "count": conditions.count,
+                "nativeError": error.localizedDescription
+            ])
+            XCTContext.runActivity(named: "GPTDriver Native CheckBulk Failed, AI Fallback") { _ in }
+            return try performSync(timeout: timeout) {
+                try await self._checkBulkAsync(conditions, maxRetries: maxRetries, retryDelay: retryDelay)
+            }
+        } else {
+            log(.info, "Native checkBulk succeeded", metadata: ["count": conditions.count])
+            XCTContext.runActivity(named: "GPTDriver Native CheckBulk Succeeded (\(conditions.count) conditions)") { _ in }
+            return Dictionary(uniqueKeysWithValues: conditions.map { ($0, true) })
+        }
+    }
+
     // MARK: - Session Management
     private func startSession() async throws {
         if !appiumSessionStarted {
@@ -783,6 +955,7 @@ public class GptDriver {
         }
         let sessionURL = "https://app.mobileboost.io/gpt-driver/sessions/\(sessionId)"
         log(.notice, "Live Session View", metadata: ["sessionURL": sessionURL])
+        print("[gptdriver] GPTDriver Live Session URL: \(sessionURL)")
         self.gptDriverSessionId = sessionId
         self.sessionURL = sessionURL
 
