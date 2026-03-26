@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 import UIKit
 import os
+import ObjCExceptionCatcher
 
 // MARK: - Models for Appium/GPT Commands
 
@@ -714,6 +715,44 @@ public class GptDriver {
         }
     }
 
+    /// Runs a native action closure, catching Swift errors, ObjC exceptions,
+    /// and XCTest assertion failures. Temporarily intercepts XCTestCase failure
+    /// recording so that assertion failures inside the closure are not persisted
+    /// to the test result -- the SDK will fall back to AI instead.
+    private func runNativeAction(_ activityName: String,
+                                 _ nativeAction: () throws -> Void) -> Error? {
+        var nativeError: Error?
+        XCTContext.runActivity(named: activityName) { _ in
+            var caughtException: NSException?
+
+            let hadInterceptedFailure = GPTDWithInterceptedTestFailures {
+                caughtException = GPTDCatchObjCException {
+                    do {
+                        try nativeAction()
+                    } catch {
+                        nativeError = error
+                    }
+                }
+            }
+
+            if nativeError == nil, let exception = caughtException {
+                log(.warning, "Native action threw ObjC exception (intercepted)",
+                    metadata: ["exception": exception.name.rawValue,
+                               "reason": exception.reason ?? "unknown"])
+                nativeError = GPTDriverError.executionFailed(
+                    "Native action exception: \(exception.name.rawValue) - \(exception.reason ?? "unknown")"
+                )
+            }
+            if nativeError == nil, hadInterceptedFailure {
+                log(.warning, "XCTest assertion failure intercepted in native action; AI will take over")
+                nativeError = GPTDriverError.executionFailed(
+                    "XCTest assertion failure detected in native action"
+                )
+            }
+        }
+        return nativeError
+    }
+
     /// Executes a command, trying native XCUITest code first and falling back to AI execution on failure.
     ///
     /// - Parameters:
@@ -728,14 +767,7 @@ public class GptDriver {
         try ensureSession(timeout: timeout)
 
         log(.info, "Native execute attempt", metadata: ["command": command])
-        var nativeError: Error?
-        XCTContext.runActivity(named: "GPTDriver Native Execute: \(command)") { _ in
-            do {
-                try nativeAction()
-            } catch {
-                nativeError = error
-            }
-        }
+        let nativeError = runNativeAction("GPTDriver Native Execute: \(command)", nativeAction)
 
         if let error = nativeError {
             log(.warning, "Native execute failed, falling back to AI", metadata: [
@@ -768,14 +800,7 @@ public class GptDriver {
         try ensureSession(timeout: timeout)
 
         log(.info, "Native assert attempt", metadata: ["assertion": assertion])
-        var nativeError: Error?
-        XCTContext.runActivity(named: "GPTDriver Native Assert: \(assertion)") { _ in
-            do {
-                try nativeAction()
-            } catch {
-                nativeError = error
-            }
-        }
+        let nativeError = runNativeAction("GPTDriver Native Assert: \(assertion)", nativeAction)
 
         if let error = nativeError {
             log(.warning, "Native assert failed, falling back to AI", metadata: [
@@ -808,14 +833,8 @@ public class GptDriver {
         try ensureSession(timeout: timeout)
 
         log(.info, "Native assertBulk attempt", metadata: ["count": assertions.count])
-        var nativeError: Error?
-        XCTContext.runActivity(named: "GPTDriver Native AssertBulk (\(assertions.count) conditions)") { _ in
-            do {
-                try nativeAction()
-            } catch {
-                nativeError = error
-            }
-        }
+        let nativeError = runNativeAction(
+            "GPTDriver Native AssertBulk (\(assertions.count) conditions)", nativeAction)
 
         if let error = nativeError {
             log(.warning, "Native assertBulk failed, falling back to AI", metadata: [
@@ -850,14 +869,8 @@ public class GptDriver {
         try ensureSession(timeout: timeout)
 
         log(.info, "Native checkBulk attempt", metadata: ["count": conditions.count])
-        var nativeError: Error?
-        XCTContext.runActivity(named: "GPTDriver Native CheckBulk (\(conditions.count) conditions)") { _ in
-            do {
-                try nativeAction()
-            } catch {
-                nativeError = error
-            }
-        }
+        let nativeError = runNativeAction(
+            "GPTDriver Native CheckBulk (\(conditions.count) conditions)", nativeAction)
 
         if let error = nativeError {
             log(.warning, "Native checkBulk failed, falling back to AI", metadata: [

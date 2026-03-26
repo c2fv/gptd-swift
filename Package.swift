@@ -14,8 +14,13 @@ let package = Package(
     dependencies: [],
     targets: [
         .target(
+            name: "ObjCExceptionCatcher",
+            path: "Sources/ObjCExceptionCatcher",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "gptd-swift",
-            dependencies: [],
+            dependencies: ["ObjCExceptionCatcher"],
             linkerSettings: [
                 .linkedFramework("XCTest")
             ])
