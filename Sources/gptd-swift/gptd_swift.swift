@@ -490,6 +490,7 @@ public class GptDriver {
     
     private let cachingMode: CachingMode
     private let testId: String
+    private let additionalUserContext: String
     private var stepCounter: Int = 1
     
     /// Optional callback that is invoked when a new session is created.
@@ -538,7 +539,8 @@ public class GptDriver {
                   platformVersion: String? = nil,
                   nativeApp: XCUIApplication? = nil,
                   cachingMode: CachingMode = .none,
-                  testId: String = "") {
+                  testId: String = "",
+                  additionalUserContext: String = "") {
         self.apiKey = apiKey
         self.appiumServerUrl = appiumServerUrl
         self.deviceName = deviceName
@@ -547,6 +549,7 @@ public class GptDriver {
         self.gptDriverBaseUrl = URL(string: "https://api.mobileboost.io")!
         self.cachingMode = cachingMode
         self.testId = testId
+        self.additionalUserContext = additionalUserContext
         
         if appiumServerUrl == nil {
             self.nativeApp = nativeApp ?? XCUIApplication()
@@ -561,11 +564,13 @@ public class GptDriver {
     ///   - nativeApp: The XCUIApplication instance representing the app under test. Defaults to `XCUIApplication()`
     ///   - cachingMode: The caching mode to use for interactions. Defaults to `.none`
     ///   - testId: Optional test identifier used for cache matching. Defaults to empty string.
+    ///   - additionalUserContext: Optional free-form context string sent to the backend alongside the session. Defaults to empty string.
     public convenience init(apiKey: String,
                             nativeApp: XCUIApplication = XCUIApplication(),
                             cachingMode: CachingMode = .none,
-                            testId: String = "") {
-        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId)
+                            testId: String = "",
+                            additionalUserContext: String = "") {
+        self.init(apiKey: apiKey, appiumServerUrl: nil, deviceName: nil, platform: nil, platformVersion: nil, nativeApp: nativeApp, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext)
     }
     
     /// Initializes GptDriver for execution via a remote Appium server.
@@ -577,14 +582,16 @@ public class GptDriver {
     ///   - platformVersion: The OS version of the target device (e.g., "18.2").
     ///   - cachingMode: The caching mode to use for interactions. Defaults to `.none`
     ///   - testId: Optional test identifier used for cache matching. Defaults to empty string.
+    ///   - additionalUserContext: Optional free-form context string sent to the backend alongside the session. Defaults to empty string.
     public convenience init(apiKey: String,
                             appiumServerUrl: URL,
                             deviceName: String,
                             platform: String,
                             platformVersion: String,
                             cachingMode: CachingMode = .none,
-                            testId: String = "") {
-        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil, cachingMode: cachingMode, testId: testId)
+                            testId: String = "",
+                            additionalUserContext: String = "") {
+        self.init(apiKey: apiKey, appiumServerUrl: appiumServerUrl, deviceName: deviceName, platform: platform, platformVersion: platformVersion, nativeApp: nil, cachingMode: cachingMode, testId: testId, additionalUserContext: additionalUserContext)
     }
     
     deinit {
@@ -931,18 +938,29 @@ public class GptDriver {
             .appendingPathComponent("sessions")
             .appendingPathComponent("create")
         
+        let deviceResolution: String
+        if appiumServerUrl != nil {
+            let windowSize = try await getAppiumWindowRect()
+            deviceResolution = "\(Int(windowSize.width))x\(Int(windowSize.height))"
+        } else {
+            let nativeBounds = UIScreen.main.nativeBounds.size
+            deviceResolution = "\(Int(nativeBounds.width))x\(Int(nativeBounds.height))"
+        }
+        
         let body: [String: Any] = [
             "api_key": apiKey,
             "appium_session_id": appiumSessionId,
             "device_config": [
                 "platform": platform ?? "",
                 "device": deviceName ?? "",
-                "os": platformVersion ?? ""
+                "os": platformVersion ?? "",
+                "screenResolution": deviceResolution
             ],
             "use_internal_virtual_device": false,
             "build_id": "",
             "test_id": testId,
-            "caching_mode": cachingMode.rawValue
+            "caching_mode": cachingMode.rawValue,
+            "additional_user_context": additionalUserContext
         ]
         
         let responseData = try await postJson(to: url, jsonObject: body)
