@@ -735,15 +735,26 @@ public class GptDriver {
                 }
             }
 
-            if nativeError == nil, let exception = caughtException {
-                log(.warning, "Native action threw ObjC exception (intercepted)",
-                    metadata: ["exception": exception.name.rawValue,
-                               "reason": exception.reason ?? "unknown"])
-                nativeError = GPTDriverError.executionFailed(
-                    "Native action exception: \(exception.name.rawValue) - \(exception.reason ?? "unknown")"
-                )
-            }
-            if nativeError == nil, hadInterceptedFailure {
+            guard nativeError == nil else { return }
+
+            if let exception = caughtException {
+                if exception.name.rawValue == GPTDInterceptedTestFailureException {
+                    log(.warning, "XCTest assertion failure intercepted in native action; AI will take over")
+                    nativeError = GPTDriverError.executionFailed(
+                        "XCTest assertion failure detected in native action"
+                    )
+                } else {
+                    log(.warning, "Native action threw ObjC exception",
+                        metadata: ["exception": exception.name.rawValue,
+                                   "reason": exception.reason ?? "unknown"])
+                    nativeError = GPTDriverError.executionFailed(
+                        "Native action exception: \(exception.name.rawValue) - \(exception.reason ?? "unknown")"
+                    )
+                }
+            } else if hadInterceptedFailure {
+                // Safety net: the swizzle set the captured flag but the thrown
+                // exception was caught internally by XCTest before reaching
+                // GPTDCatchObjCException. Unreachable in normal operation.
                 log(.warning, "XCTest assertion failure intercepted in native action; AI will take over")
                 nativeError = GPTDriverError.executionFailed(
                     "XCTest assertion failure detected in native action"

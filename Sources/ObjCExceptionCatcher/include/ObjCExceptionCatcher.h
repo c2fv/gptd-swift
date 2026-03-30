@@ -15,4 +15,9 @@ FOUNDATION_EXPORT NSException * _Nullable GPTDCatchObjCException(NS_NOESCAPE voi
 /// if the block exits early (e.g. via an ObjC exception caught by the caller).
 FOUNDATION_EXPORT BOOL GPTDWithInterceptedTestFailures(NS_NOESCAPE void (^block)(void));
 
+/// Exception name thrown by the interceptor when a user-facing XCTest assertion
+/// failure is detected inside a GPTDWithInterceptedTestFailures block.
+/// Caught by GPTDCatchObjCException so the SDK can fall back to AI.
+FOUNDATION_EXPORT NSString * const GPTDInterceptedTestFailureException;
+
 NS_ASSUME_NONNULL_END

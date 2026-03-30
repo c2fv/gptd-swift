@@ -1,5 +1,6 @@
 #import "ObjCExceptionCatcher.h"
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 NSException * _Nullable GPTDCatchObjCException(NS_NOESCAPE void (^block)(void)) {
     @try {
@@ -18,11 +19,28 @@ static NSString * const kGPTDCapturedKey  = @"GPTDCapturedTestFailures";
 static IMP sOriginalRecordIssueIMP = NULL;
 static BOOL sSwizzled = NO;
 
+// XCTIssueType values we want to intercept (from XCTIssue.h):
+//   0 = XCTIssueTypeAssertionFailure
+//   1 = XCTIssueTypeThrownError
+//   2 = XCTIssueTypeUncaughtException
+// We intentionally pass through system issues (4), performance regressions (3),
+// and other internal types so XCTest bookkeeping is not disrupted.
+static BOOL gptd_isUserFacingIssue(id issue) {
+    SEL typeSel = NSSelectorFromString(@"type");
+    if (![issue respondsToSelector:typeSel]) return NO;
+    NSInteger type = ((NSInteger (*)(id, SEL))objc_msgSend)(issue, typeSel);
+    return type <= 2;
+}
+
+NSString * const GPTDInterceptedTestFailureException = @"GPTDInterceptedTestFailure";
+
 static void gptd_swizzledRecordIssue(id self, SEL _cmd, id issue) {
     NSMutableDictionary *threadDict = NSThread.currentThread.threadDictionary;
-    if ([threadDict[kGPTDInterceptKey] boolValue]) {
+    if ([threadDict[kGPTDInterceptKey] boolValue] && gptd_isUserFacingIssue(issue)) {
         threadDict[kGPTDCapturedKey] = @YES;
-        return;
+        @throw [NSException exceptionWithName:GPTDInterceptedTestFailureException
+                                       reason:@"XCTest assertion failure intercepted by GptDriver"
+                                     userInfo:nil];
     }
     if (sOriginalRecordIssueIMP) {
         ((void (*)(id, SEL, id))sOriginalRecordIssueIMP)(self, _cmd, issue);
